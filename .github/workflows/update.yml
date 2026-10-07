@@ -1,0 +1,99 @@
+name: Update MAGI release branch
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/update.yml"
+
+  schedule:
+    - cron: "5 16 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Update MAGI branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(
+            curl --fail --silent --show-error --location \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/JamePeng/llama-cpp-python/releases/latest" |
+              jq -er '.tag_name'
+          )"
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+
+          echo "Latest release tag: $TAG"
+
+          git remote add release-upstream \
+            https://github.com/JamePeng/llama-cpp-python.git
+
+          git fetch --force --no-tags release-upstream \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
+
+          RELEASE_COMMIT="$(git rev-parse --verify "${TAG}^{commit}")"
+
+          echo "Release commit: $RELEASE_COMMIT"
+
+          if git ls-remote --exit-code --heads origin MAGI >/dev/null 2>&1; then
+            git fetch --no-tags origin \
+              "refs/heads/MAGI:refs/remotes/origin/MAGI"
+            BASE_COMMIT="$(git rev-parse refs/remotes/origin/MAGI)"
+          else
+            BASE_COMMIT="$(git rev-parse HEAD)"
+          fi
+
+          git checkout --detach "$BASE_COMMIT"
+
+          if [ ! -f ".github/workflows/update.yml" ]; then
+            echo "Missing .github/workflows/update.yml in base commit." >&2
+            exit 1
+          fi
+
+          git read-tree --reset -u "$RELEASE_COMMIT"
+
+          git restore \
+            --source="$BASE_COMMIT" \
+            --staged \
+            --worktree \
+            -- .github/workflows
+
+          if ! git diff --cached --quiet -- \
+            .github/workflows; then
+            echo "Refusing to modify GitHub workflow files." >&2
+            exit 1
+          fi
+
+          if git diff --cached --quiet; then
+            echo "MAGI already tracks the latest release."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Sync MAGI to ${TAG}"
+
+          git push origin \
+            HEAD:refs/heads/MAGI
