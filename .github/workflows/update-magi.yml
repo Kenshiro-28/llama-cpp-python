@@ -5,10 +5,10 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/update.yml"
+      - ".github/workflows/update-magi.yml"
 
   schedule:
-    - cron: "50 15 * * *"
+    - cron: "45 15 * * *"
 
 permissions:
   contents: write
