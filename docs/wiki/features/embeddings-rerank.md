@@ -4,8 +4,9 @@ feature_name: Embeddings and Reranking
 source_files:
   - llama_cpp/llama.py
   - llama_cpp/llama_embedding.py
+  - llama_cpp/llama_multimodal.py
   - llama_cpp/_internals.py
-last_updated: 2026-09-17
+last_updated: 2026-10-14
 version_target: "latest"
 ---
 
@@ -13,11 +14,12 @@ version_target: "latest"
 
 ## Overview
 
-`llama-cpp-python` can use compatible GGUF models for three related inference
+`llama-cpp-python` can use compatible GGUF models for four related inference
 workflows:
 
 - **Sentence or document embeddings** produce one vector per input.
 - **Token embeddings** produce one vector per token.
+- **Multimodal embeddings** pool text, images and audio into one vector using a matching projector.
 - **Reranking** scores each query/document pair with a cross-encoder model.
 
 The general-purpose `Llama` class and the specialized `LlamaEmbedding` class
@@ -39,6 +41,7 @@ embedding capabilities.
 | Inspect a vector for every token | `embed()` | `LLAMA_POOLING_TYPE_NONE` |
 | Score documents against a query | `LlamaEmbedding.rank()` | `LLAMA_POOLING_TYPE_RANK` |
 | Return raw arrays or a cosine-similarity matrix | `LlamaEmbedding.create_embedding()` | Sequence pooling |
+| Embed text together with images or audio | `LlamaEmbedding.embed_multimodal()` | Model-required attention mode and MEAN/CLS/LAST pooling |
 
 Use the pooling configuration documented by the model author whenever one is
 provided. `LLAMA_POOLING_TYPE_UNSPECIFIED` lets model metadata select the
@@ -72,18 +75,114 @@ the output shape and quality before deploying a new model or quantization.
 | `Llama.embed()` | Raw sequence, token-level, or rank output with optional token counting |
 | `Llama.create_embedding()` | OpenAI-compatible response wrapper; defaults to raw vectors |
 | `LlamaEmbedding.embed()` | Specialized raw embedding API; defaults to L2 normalization |
+| `LlamaEmbedding.embed_multimodal()` | One pooled vector from text and encoded image/audio bytes |
 | `LlamaEmbedding.create_embedding()` | Adds `json`, `json+`, and `array` output formats |
 | `LlamaEmbedding.rank()` | Formats query/document pairs and returns reranking scores |
 | `Llama.tokenize()` | Converts text into token IDs for pre-tokenized embedding input |
 
-See [[core/Llama|Llama]] for the general model lifecycle and
-[[modules/LlamaEmbedding|Llama Embedding]] for the complete specialized class
+See [Llama](../core/Llama.md) for the general model lifecycle and
+[Llama Embedding](../modules/LlamaEmbedding.md) for the complete specialized class
 reference.
 
 ## Code Examples
 
 All examples assume that `MODEL_PATH` points to a compatible GGUF embedding or
 reranking model. Pooling requirements and output dimensions are model-specific.
+
+### Multimodal Embeddings with EmbeddingGemma 2
+
+Multimodal embeddings are available starting with `0.4.3-preview`.
+
+Use a matching `embeddinggemma-2-BF16.gguf` and
+`mmproj-embeddinggemma-2-BF16.gguf`, and an installed build containing MTMD.
+This example also needs `image.png` and `audio.wav`. The handler detects each
+media type from its bytes and loads the projector automatically on first use.
+Use a short audio clip so the combined input fits the configured 512-token limit.
+
+```python
+from contextlib import ExitStack
+from pathlib import Path
+from llama_cpp import LLAMA_POOLING_TYPE_MEAN
+from llama_cpp.llama_embedding import LlamaEmbedding
+from llama_cpp.llama_multimodal import MTMDEmbeddingHandler
+
+with ExitStack() as cleanup:
+    handler = MTMDEmbeddingHandler(
+        mmproj_path="path/to/mmproj-embeddinggemma-2-BF16.gguf",
+        use_gpu=False,
+        image_max_tokens=70,
+        verbose=False,
+    )
+    cleanup.callback(handler.close)
+    model = LlamaEmbedding(
+        model_path="path/to/embeddinggemma-2-BF16.gguf",
+        embedding_handler=handler,
+        pooling_type=LLAMA_POOLING_TYPE_MEAN,
+        n_ctx=512, n_batch=512, n_ubatch=512,
+        n_gpu_layers=0, verbose=False,
+    )
+    cleanup.callback(model.close)
+    image = Path("image.png").read_bytes()
+    audio = Path("audio.wav").read_bytes()
+    prefix = "task: sentence similarity | query: "
+    image_vector = model.embed_multimodal(parts=[prefix, image])
+    audio_vector = model.embed_multimodal(parts=[prefix, audio])
+    mixed_vector, count = model.embed_multimodal(
+        parts=["title: none | text: A picture. ", image, " A sound. ", audio],
+        return_count=True,
+    )
+    print(len(mixed_vector), count)  # 768 dimensions; text + media token count
+```
+
+For default projector settings, pass `mmproj_path` directly to `LlamaEmbedding`
+instead of constructing a handler. Use task prefixes appropriate to the model
+and retrieval/similarity task; no chat template or assistant generation suffix
+is inserted. The prefixes above are EmbeddingGemma 2 examples.
+
+As an alternative to `parts`, the same open model can accept a prompt with
+native markers and ordered media bytes:
+
+```python
+vector = model.embed_multimodal(
+    "task: sentence similarity | query: <__media__>", media=[image]
+)
+```
+
+This snippet assumes the model remains open inside the preceding cleanup scope.
+`<__media__>` is the default native marker; a loaded projector may use a different
+marker. Use `parts` to let the handler use its context's marker. Each call returns one vector,
+not a batch of document vectors or an OpenAI response wrapper.
+
+The full text/media input must fit one decoder microbatch; increase `n_ubatch`,
+`n_batch` and `n_ctx` together or shorten the input. Media encoding can use several
+native batches, but non-causal attention still requires the full input in one
+decode. Video bytes, token-level pooling and RANK pooling are not supported by
+this interface. See the [API reference](../modules/LlamaEmbedding.md)
+and [CLI example](../../../examples/multimodal_embedding.py).
+For causal models, projectors requiring chunk-local bidirectional attention
+are also unsupported by joint pooled decoding; these requests raise explicitly.
+
+### Qwen3-VL-Embedding
+
+Qwen3-VL-Embedding requires causal attention, LAST pooling, and a formatted
+instruction/user message ending in `<|im_start|>assistant\n`. Preserve the
+model's native attention mode. `embed_multimodal()` accepts the completed prompt
+or ordered parts; it does not apply chat templates automatically.
+
+The [CLI example](../../../examples/multimodal_embedding.py) provides this wrapper:
+
+```bash
+python -m examples.multimodal_embedding --profile qwen3-vl \
+  --model ./Qwen3-VL-Embedding-8B-Q8_0.gguf \
+  --mmproj ./mmproj-Qwen3-VL-Embedding-8b-BF16.gguf \
+  --prompt '<__media__>' --media ./image.png --n-gpu-layers -1
+```
+
+Use one marker per media file, or omit `--media` for text-only input. The default
+instruction is `Represent the user's input.`; set `--instruction` for a different
+retrieval task. This profile returns an L2-normalized vector with 4096 dimensions
+for the tested 8B model. EmbeddingGemma 2 remains the default CLI profile with its
+MEAN pooling and task prefixes.
 
 ### Sentence Embeddings with `Llama`
 
@@ -363,6 +462,9 @@ context resources.
 Each individual tokenized sequence must fit the configured logical batch
 capacity. Choose `n_batch` large enough for the longest intended input and use
 `truncate=True` when truncation is acceptable.
+For non-causal models, each sequence must also fit `n_ubatch` so bidirectional
+attention sees the whole input. Text `embed()` can truncate to this limit;
+`embed_multimodal()` rejects oversized inputs without truncation.
 
 ### Input and Return Shapes
 
@@ -426,9 +528,9 @@ For OpenAI-compatible vector-store clients, use sequence pooling so each
   architectures. Validate output quality and shape before production use.
 
 ## Related Features
-- [[Index-Home](https://github.com/JamePeng/llama-cpp-python/blob/main/docs/wiki/index.md)]
-- [[core/Llama|Llama](https://github.com/JamePeng/llama-cpp-python/blob/main/docs/wiki/core/Llama.md)] — General model lifecycle and built-in embedding APIs.
-- [[modules/LlamaEmbedding|Llama Embedding](https://github.com/JamePeng/llama-cpp-python/blob/main/docs/wiki/modules/LlamaEmbedding.md)] — Specialized API reference,
+- [Wiki index](../index.md)
+- [Llama](../core/Llama.md) — General model lifecycle and built-in embedding APIs.
+- [Llama Embedding](../modules/LlamaEmbedding.md) — Specialized API reference,
   normalization constants, and reranking methods.
-- [[install|Installation](https://github.com/JamePeng/llama-cpp-python/blob/main/docs/wiki/install.md)] — Backend selection, GPU acceleration, and source
+- [Installation](../install.md) — Backend selection, GPU acceleration, and source
   installation.

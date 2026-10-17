@@ -11,6 +11,7 @@ from ._ggml import (
     ggml_log_callback,
     ggml_opt_get_optimizer_params,
     ggml_cgraph,
+    ggml_tensor_p,
     ggml_threadpool_p,
 )
 
@@ -76,13 +77,13 @@ LLAMA_FILE_MAGIC_GGSQ = 0x67677371
 
 # define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
 LLAMA_SESSION_MAGIC = LLAMA_FILE_MAGIC_GGSN
-# define LLAMA_SESSION_VERSION 10
-LLAMA_SESSION_VERSION = 10
+# define LLAMA_SESSION_VERSION 11
+LLAMA_SESSION_VERSION = 11
 
 # define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 LLAMA_STATE_SEQ_MAGIC = LLAMA_FILE_MAGIC_GGSQ
-# define LLAMA_STATE_SEQ_VERSION 3
-LLAMA_STATE_SEQ_VERSION = 3
+# define LLAMA_STATE_SEQ_VERSION 4
+LLAMA_STATE_SEQ_VERSION = 4
 
 # struct llama_vocab;
 llama_vocab_p = NewType("llama_vocab_p", int)
@@ -131,7 +132,9 @@ llama_seq_id = ctypes.c_int32
 #     LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
 #     LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
 # };
-class llama_vocab_type(enum.IntEnum):
+class LlamaVocabType(enum.IntEnum):
+    """Vocabulary types; llama_vocab_type is the native query function."""
+
     LLAMA_VOCAB_TYPE_NONE   = 0
     """For models without vocab"""
     LLAMA_VOCAB_TYPE_SPM    = 1
@@ -150,8 +153,7 @@ class llama_vocab_type(enum.IntEnum):
     """Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex"""
 
 
-# NOTE: Deprecated and will be removed in the future. (already gone in llama.cpp)
-# https://github.com/ggml-org/llama.cpp/blob/master/src/llama-vocab.h#L10
+# Defined in llama.cpp/src/llama-vocab.h, not the public llama.h.
 # // pre-tokenization types
 # enum llama_vocab_pre_type {
 #     LLAMA_VOCAB_PRE_TYPE_DEFAULT           = 0,
@@ -211,6 +213,10 @@ class llama_vocab_type(enum.IntEnum):
 #     LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI = 54,
 #     LLAMA_VOCAB_PRE_TYPE_MELLUM2           = 55,
 #     LLAMA_VOCAB_PRE_TYPE_LAGUNA            = 56,
+#     LLAMA_VOCAB_PRE_TYPE_HY_V4             = 57,
+#     LLAMA_VOCAB_PRE_TYPE_SPARK2_5          = 58,
+#     LLAMA_VOCAB_PRE_TYPE_UFAKZEKA          = 59,
+#     LLAMA_VOCAB_PRE_TYPE_MMBERT            = 60,
 # };
 class llama_vocab_pre_type(enum.IntEnum):
     LLAMA_VOCAB_PRE_TYPE_DEFAULT = 0
@@ -270,6 +276,10 @@ class llama_vocab_pre_type(enum.IntEnum):
     LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI = 54
     LLAMA_VOCAB_PRE_TYPE_MELLUM2 = 55
     LLAMA_VOCAB_PRE_TYPE_LAGUNA = 56
+    LLAMA_VOCAB_PRE_TYPE_HY_V4 = 57
+    LLAMA_VOCAB_PRE_TYPE_SPARK2_5 = 58
+    LLAMA_VOCAB_PRE_TYPE_UFAKZEKA = 59
+    LLAMA_VOCAB_PRE_TYPE_MMBERT = 60
 
 
 # // note: these values should be synchronized with ggml_rope
@@ -951,6 +961,8 @@ llama_sampler_seq_config_p = ctypes.POINTER(llama_sampler_seq_config)
 #     enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
 #     enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+#     size_t moe_cache_size; // device cache bytes for host-memory MoE experts, 0 = disabled [EXPERIMENTAL]
+
 #     // Abort callback
 #     // if it returns true, execution of llama_decode() will be aborted
 #     // currently works only with CPU execution
@@ -1013,6 +1025,8 @@ class llama_context_params(ctypes.Structure):
         type_k (int): data type for K cache
         type_v (int): data type for V cache
 
+        moe_cache_size (int): Device cache bytes for host-memory MoE experts, split among devices like layers; 0 disables it. Experimental.
+
         abort_callback (ggml_abort_callback): abort callback if it returns true, execution of llama_decode() will be aborted
         abort_callback_data (ctypes.ctypes.c_void_p): data for abort_callback
 
@@ -1056,6 +1070,7 @@ class llama_context_params(ctypes.Structure):
         cb_eval_user_data: ctypes.c_void_p
         type_k: int
         type_v: int
+        moe_cache_size: int
         abort_callback: Callable[[ctypes.c_void_p], bool]
         abort_callback_data: ctypes.c_void_p
         embeddings: bool
@@ -1095,6 +1110,7 @@ class llama_context_params(ctypes.Structure):
         ("cb_eval_user_data", ctypes.c_void_p),
         ("type_k", ctypes.c_int),
         ("type_v", ctypes.c_int),
+        ("moe_cache_size", ctypes.c_size_t),
         ("abort_callback", ggml_abort_callback),
         ("abort_callback_data", ctypes.c_void_p),
         ("embeddings", ctypes.c_bool),
@@ -1675,15 +1691,23 @@ def llama_free(ctx: llama_context_p, /):
     ...
 
 
-# enum llama_params_fit_status {
-#     LLAMA_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
-#     LLAMA_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
-#     LLAMA_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
+# enum common_params_fit_status { // llama.cpp/common/fit.h
+#     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0,
+#     COMMON_PARAMS_FIT_STATUS_FAILURE = 1,
+#     COMMON_PARAMS_FIT_STATUS_ERROR   = 2,
 # };
+class common_params_fit_status(enum.IntEnum):
+    COMMON_PARAMS_FIT_STATUS_SUCCESS = 0
+    COMMON_PARAMS_FIT_STATUS_FAILURE = 1
+    COMMON_PARAMS_FIT_STATUS_ERROR = 2
+
+
 class llama_params_fit_status(enum.IntEnum):
-    LLAMA_PARAMS_FIT_STATUS_SUCCESS = 0
-    LLAMA_PARAMS_FIT_STATUS_FAILURE = 1
-    LLAMA_PARAMS_FIT_STATUS_ERROR   = 2
+    """Compatibility names for the status now defined in common/fit.h."""
+
+    LLAMA_PARAMS_FIT_STATUS_SUCCESS = common_params_fit_status.COMMON_PARAMS_FIT_STATUS_SUCCESS
+    LLAMA_PARAMS_FIT_STATUS_FAILURE = common_params_fit_status.COMMON_PARAMS_FIT_STATUS_FAILURE
+    LLAMA_PARAMS_FIT_STATUS_ERROR = common_params_fit_status.COMMON_PARAMS_FIT_STATUS_ERROR
 
 
 # LLAMA_API int64_t llama_time_us(void);
@@ -1919,9 +1943,9 @@ def llama_model_cls_label(model: llama_model_p, i: ctypes.c_uint32, /) -> ctypes
     ...
 
 
-# LLAMA_API enum llama_vocab_type   llama_vocab_type  (const struct llama_model * model);
-@ctypes_function("llama_vocab_type", [llama_model_p_ctypes], ctypes.c_int)
-def llama_vocab_type(model: llama_model_p, /) -> int:
+# LLAMA_API enum llama_vocab_type llama_vocab_type(const struct llama_vocab * vocab);
+@ctypes_function("llama_vocab_type", [llama_vocab_p_ctypes], ctypes.c_int)
+def llama_vocab_type(vocab: llama_vocab_p, /) -> int:
     ...
 
 
@@ -3316,7 +3340,10 @@ def llama_batch_ext_set_embd_token(batch: llama_batch_ext_p, idx: int, embd: lla
     ctypes.c_bool,
 )
 def llama_batch_ext_set_embd_state(batch: llama_batch_ext_p, idx: int, embd: llama_embd, /) -> bool:
-    """Set state embeddings. The current native implementation returns False."""
+    """Set hidden state; return False for unsupported contexts or invalid input.
+
+    Currently MTP contexts accept states with the model's output embedding width.
+    """
     ...
 
 
@@ -5313,8 +5340,16 @@ def llama_log_set(
 #     int32_t n_p_eval;   // number of prompt tokens
 #     int32_t n_eval;     // number of generated tokens
 #     int32_t n_reused;   // number of times a ggml compute graph had been reused
+#     int32_t n_reallocs_same; // number of graph reallocations during inference with an unchanged graph size
+#     int32_t n_reallocs_diff; // number of graph reallocations during inference with a changed graph size
 # };
 class llama_perf_context_data(ctypes.Structure):
+    """Timing interval and graph statistics returned by llama.cpp.
+
+    n_reallocs_same/diff count compute-buffer reallocations with unchanged/
+    changed graph size, excluding changes in backend assignments. They are
+    context lifetime totals and survive llama_perf_context_reset().
+    """
     _fields_ = [
         ("t_start_ms", ctypes.c_double),
         ("t_load_ms", ctypes.c_double),
@@ -5323,6 +5358,8 @@ class llama_perf_context_data(ctypes.Structure):
         ("n_p_eval", ctypes.c_int32),
         ("n_eval", ctypes.c_int32),
         ("n_reused", ctypes.c_int32),
+        ("n_reallocs_same", ctypes.c_int32),
+        ("n_reallocs_diff", ctypes.c_int32),
     ]
 
 
@@ -5344,6 +5381,7 @@ class llama_perf_sampler_data(ctypes.Structure):
     llama_perf_context_data,
 )
 def llama_perf_context(ctx: llama_context_p, /) -> llama_perf_context_data:
+    """Read interval statistics and lifetime graph-reallocation counters."""
     ...
 
 
@@ -5364,6 +5402,7 @@ def llama_perf_context_print(ctx: llama_context_p, /):
     None,
 )
 def llama_perf_context_reset(ctx: llama_context_p, /):
+    """Reset the timing/reuse interval; preserve load time and reallocation totals."""
     ...
 
 
@@ -5489,6 +5528,8 @@ def llama_opt_epoch(
 # // breaking changes and C++ are allowed. everything here should be considered WIP
 # // try as much as possible to not include this header in the rest of the codebase
 
+# Optional bindings accept C, MSVC, and Itanium ABI symbol names. Missing
+# symbols raise RuntimeError when called, so older libraries remain importable.
 ctypes_function_llama_ext = ctypes_function_for_shared_library(_lib)
 
 # // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
@@ -5514,8 +5555,17 @@ def llama_graph_reserve(
     n_seqs: ctypes.c_uint32,
     n_outputs: ctypes.c_uint32,
 ) -> ctypes.POINTER(ggml_cgraph):  # type: ignore
-    """
-    Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
+    """Reserve a compute graph for the specified batch dimensions.
+
+    Args:
+        ctx: Context that owns the graph.
+        n_tokens: Number of input tokens.
+        n_seqs: Number of sequences.
+        n_outputs: Number of requested output rows.
+
+    Returns:
+        A borrowed graph pointer, valid until the next graph reservation.
+        Do not free it separately from the context.
     """
     ...
 
@@ -5535,10 +5585,180 @@ def llama_graph_reserve(
 def llama_ftype_get_default_type(
     ftype: llama_ftype
 ) -> int:
-    """
-    Get the default ggml_type for a given ftype.
+    """Return the default ggml_type for a llama_ftype value.
+
+    Individual tensors may receive a different type during quantization.
     """
     ...
+
+# struct quantize_state_impl;
+quantize_state_impl_p = NewType("quantize_state_impl_p", int)
+quantize_state_impl_p_ctypes = ctypes.c_void_p
+
+
+# LLAMA_API quantize_state_impl * llama_quant_init(
+#         const llama_model * model,
+#         const llama_model_quantize_params * params);
+@ctypes_function_llama_ext(
+    [
+        "llama_quant_init",
+        "?llama_quant_init@@YAPEAUquantize_state_impl@@PEBUllama_model@@PEBUllama_model_quantize_params@@@Z",
+        "__Z16llama_quant_initPK11llama_modelPK27llama_model_quantize_params",
+        "_Z16llama_quant_initPK11llama_modelPK27llama_model_quantize_params",
+    ],
+    [llama_model_p_ctypes, ctypes.POINTER(llama_model_quantize_params)],
+    quantize_state_impl_p_ctypes,
+    required=False,
+)
+def llama_quant_init(
+    model: llama_model_p,
+    params: CtypesPointerOrRef[llama_model_quantize_params],
+) -> quantize_state_impl_p:
+    """Create quantization state; release it with llama_quant_free().
+
+    Args:
+        model: Model whose architecture and hyperparameters guide quantization.
+        params: Pointer to the quantization parameters.
+
+    Returns:
+        A caller-owned opaque state pointer.
+
+    Keep the model and the parameters (including their pointer-backed data)
+    alive until the state is freed.
+    """
+    ...
+
+
+# LLAMA_API void llama_quant_free(quantize_state_impl * qs);
+@ctypes_function_llama_ext(
+    [
+        "llama_quant_free",
+        "?llama_quant_free@@YAXPEAUquantize_state_impl@@@Z",
+        "__Z16llama_quant_freeP19quantize_state_impl",
+        "_Z16llama_quant_freeP19quantize_state_impl",
+    ],
+    [quantize_state_impl_p_ctypes],
+    None,
+    required=False,
+)
+def llama_quant_free(qs: quantize_state_impl_p):
+    """Release quantization state created by llama_quant_init().
+
+    The model and parameter storage are not freed. Do not reuse qs afterward.
+    """
+    ...
+
+
+class llama_quant_model_desc(ctypes.Structure):
+    """Metadata descriptor for a mock model used in quantization tests."""
+
+    _fields_ = [
+        ("architecture", ctypes.c_char_p),
+        ("n_embd", ctypes.c_uint32),
+        ("n_ff", ctypes.c_uint32),
+        ("n_layer", ctypes.c_uint32),
+        ("n_head", ctypes.c_uint32),
+        ("n_head_kv", ctypes.c_uint32),
+        ("n_expert", ctypes.c_uint32),
+        ("n_embd_head_k", ctypes.c_uint32),
+        ("n_embd_head_v", ctypes.c_uint32),
+    ]
+
+
+# LLAMA_API llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * desc);
+@ctypes_function_llama_ext(
+    [
+        "llama_quant_model_from_metadata",
+        "?llama_quant_model_from_metadata@@YAPEAUllama_model@@PEBUllama_quant_model_desc@@@Z",
+        "__Z31llama_quant_model_from_metadataPK22llama_quant_model_desc",
+        "_Z31llama_quant_model_from_metadataPK22llama_quant_model_desc",
+    ],
+    [ctypes.POINTER(llama_quant_model_desc)],
+    llama_model_p_ctypes,
+    required=False,
+)
+def llama_quant_model_from_metadata(
+    desc: CtypesPointerOrRef[llama_quant_model_desc],
+) -> llama_model_p:
+    """Create a mock model from a llama_quant_model_desc pointer.
+
+    The model supplies metadata for quantization planning, not loaded weights
+    for inference. Release any dependent quantization state before calling
+    llama_model_free() on the returned model.
+    """
+    ...
+
+
+# LLAMA_API bool llama_quant_tensor_allows_quantization(
+#         const quantize_state_impl * qs,
+#         const ggml_tensor * tensor);
+@ctypes_function_llama_ext(
+    [
+        "llama_quant_tensor_allows_quantization",
+        "?llama_quant_tensor_allows_quantization@@YA_NPEBUquantize_state_impl@@PEBUggml_tensor@@@Z",
+        "__Z38llama_quant_tensor_allows_quantizationPK19quantize_state_implPK11ggml_tensor",
+        "_Z38llama_quant_tensor_allows_quantizationPK19quantize_state_implPK11ggml_tensor",
+    ],
+    [quantize_state_impl_p_ctypes, ggml_tensor_p],
+    ctypes.c_bool,
+    required=False,
+)
+def llama_quant_tensor_allows_quantization(
+    qs: quantize_state_impl_p,
+    tensor: ggml_tensor_p,     # type: ignore
+) -> bool:
+    """Return whether a tensor can be quantized with this state's parameters.
+
+    Pass a live quantization state and a valid ggml_tensor pointer. The native
+    check uses the tensor's name, dimensions, and the model architecture.
+    """
+    ...
+
+
+# LLAMA_API void llama_quant_compute_types(
+#         quantize_state_impl * qs,
+#         llama_ftype ftype,
+#         ggml_tensor ** tensors,
+#         ggml_type * result_types,
+#         size_t n_tensors);
+@ctypes_function_llama_ext(
+    [
+        "llama_quant_compute_types",
+        "?llama_quant_compute_types@@YAXPEAUquantize_state_impl@@W4llama_ftype@@PEAPEAUggml_tensor@@PEAW4ggml_type@@_K@Z",
+        "__Z25llama_quant_compute_typesP19quantize_state_impl11llama_ftypePP11ggml_tensorP9ggml_typem",
+        "_Z25llama_quant_compute_typesP19quantize_state_impl11llama_ftypePP11ggml_tensorP9ggml_typem",
+    ],
+    [
+        quantize_state_impl_p_ctypes,
+        ctypes.c_int,
+        ctypes.POINTER(ggml_tensor_p),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_size_t,
+    ],
+    None,
+    required=False,
+)
+def llama_quant_compute_types(
+    qs: quantize_state_impl_p,
+    ftype: int,
+    tensors: CtypesArray[ggml_tensor_p],     # type: ignore
+    result_types: CtypesArray[ctypes.c_int],
+    n_tensors: int,
+):
+    """Fill a caller-owned ggml_type array with quantization assignments.
+
+    Args:
+        qs: Live quantization state.
+        ftype: Target llama_ftype for this computation.
+        tensors: Array of ggml_tensor pointers to classify.
+        result_types: Writable array of C int enum values, one per tensor.
+        n_tensors: Number of entries to read and write.
+
+    Both arrays must contain at least n_tensors entries. Every tensor must
+    pass llama_quant_tensor_allows_quantization() before this call.
+    """
+    ...
+
 
 # LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 @ctypes_function_llama_ext(
@@ -5555,6 +5775,7 @@ def llama_ftype_get_default_type(
 def llama_model_n_expert(
     model: llama_model_p
 ) -> ctypes.c_int32:
+    """Return the model's expert count, or zero for a model without experts."""
     ...
 
 # LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
@@ -5572,6 +5793,7 @@ def llama_model_n_expert(
 def llama_model_n_devices(
     model: llama_model_p
 ) -> ctypes.c_int32:
+    """Return the number of device entries assigned to this model."""
     ...
 
 # LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
@@ -5590,7 +5812,29 @@ def llama_model_get_device(
     model: llama_model_p,
     i: int,
 ) -> ctypes.c_void_p:
+    """Return the borrowed backend device handle at zero-based index i.
+
+    Valid indices are below llama_model_n_devices(model). An out-of-range
+    index returns NULL (None); ownership of the device is not transferred.
+    """
     ...
+
+# LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+@ctypes_function_llama_ext(
+    [
+        "llama_model_set_attn_rot",
+        "?llama_model_set_attn_rot@@YAXPEAUllama_model@@_N@Z",
+        "__Z24llama_model_set_attn_rotP11llama_modelb",
+        "_Z24llama_model_set_attn_rotP11llama_modelb",
+    ],
+    [llama_model_p_ctypes, ctypes.c_bool],
+    None,
+    required=False,
+)
+def llama_model_set_attn_rot(model: llama_model_p, value: bool) -> None:
+    """Toggle KV attention rotation for contexts subsequently created from this model."""
+    ...
+
 
 # // Set whether the context outputs nextn embeddings or not
 # // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
@@ -5612,10 +5856,13 @@ def llama_set_embeddings_nextn(
     value: bool,
     masked: bool,
 ):
-    """
-    Set whether the context outputs nextn embeddings or not
-    If masked == true,  output the embeddings only for the tokens with batch.logits != 0
-    If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+    """Enable or disable NextN embeddings used by speculative decoding.
+
+    Args:
+        ctx: Context whose output configuration is changed.
+        value: Whether to produce NextN embeddings.
+        masked: If true, emit only rows selected by batch output flags.
+            Otherwise, emit a row for every input token.
     """
     ...
 
@@ -5638,10 +5885,62 @@ def llama_set_nextn_layer_offset(
     ctx: llama_context_p,
     offset: ctypes.c_int32,
 ):
+    """Select the appended NextN block used by the DECODER_MTP graph.
+
+    offset is zero-based: the selected layer is n_layer() + offset. Use a
+    valid trained head index; zero selects the first head and is the default.
     """
-    Select which appended NextN block the DECODER_MTP graph runs (offset past
-    the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
-    chain multiple trained NextN heads. Default 0 (first head).
+    ...
+
+# // Marks the entries that a joint decision head (clef) reads, the default is 0
+# // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
+# // A run of entries with the same value is one span, spans must be separated by entries with value 0
+# // An option belongs to the last question before it
+# enum llama_decision_order {
+#     LLAMA_DECISION_ORDER_NONE            = 0, // not read by the head
+#     LLAMA_DECISION_ORDER_QUESTION_NOUL   = 1, // text of a question
+#     LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
+#     LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3,
+#     LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
+# };
+class llama_decision_order(enum.IntEnum):
+    LLAMA_DECISION_ORDER_NONE            = 0  # not read by the head
+    LLAMA_DECISION_ORDER_QUESTION_NOUL   = 1  # text of a question
+    LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2
+    LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3
+    LLAMA_DECISION_ORDER_OPTION          = 4  # text of an option
+
+# // The embeddings output has one value per entry: row i is the score of option i
+# LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
+@ctypes_function_llama_ext(
+    [
+        "llama_batch_ext_set_decision_order",
+        "?llama_batch_ext_set_decision_order@@YA_NPEAUllama_batch_ext@@HW4llama_decision_order@@@Z",
+        "__Z34llama_batch_ext_set_decision_orderP15llama_batch_exti20llama_decision_order",
+        "_Z34llama_batch_ext_set_decision_orderP15llama_batch_exti20llama_decision_order",
+    ],
+    [llama_batch_ext_p_ctypes, ctypes.c_int32, ctypes.c_int],
+    ctypes.c_bool,
+    required=False,
+)
+def llama_batch_ext_set_decision_order(
+    batch: llama_batch_ext_p,
+    idx: ctypes.c_int32,
+    order: int,
+) -> bool:
+    """Mark a batch entry as question text, option text, or ordinary text.
+
+    Args:
+        batch: Extended batch containing the entry.
+        idx: Zero-based entry index.
+        order: A llama_decision_order value.
+
+    Returns:
+        Whether the native batch accepted the update.
+
+    Consecutive entries with the same nonzero order form a span. Separate
+    spans with order NONE; each option belongs to the preceding question.
+    The joint decision head returns option scores through embedding rows.
     """
     ...
 
@@ -5662,6 +5961,12 @@ def llama_set_nextn_layer_offset(
 def llama_get_embeddings_nextn(
     ctx: llama_context_p,
 ) -> ctypes.POINTER(ctypes.c_float):  # type: ignore
+    """Return the contiguous NextN embedding output from the last evaluation.
+
+    Enable it with llama_set_embeddings_nextn() before evaluation. Rows have
+    llama_model_n_embd_out() floats. The context owns the buffer; copy values
+    before another evaluation or before freeing the context.
+    """
     ...
 
 # // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -5681,6 +5986,12 @@ def llama_get_embeddings_nextn_ith(
     ctx: llama_context_p,
     i: ctypes.c_int32,
 ) -> ctypes.POINTER(ctypes.c_float):  # type: ignore
+    """Return a borrowed pointer to one NextN embedding row.
+
+    With masked output, i follows llama_get_embeddings_ith() indexing.
+    With unmasked output, i is a nonnegative input-token row index.
+    Read llama_model_n_embd_out() floats and copy them before reevaluation.
+    """
     ...
 
 # // Set whether the context outputs the input embeddings of a specific layer
@@ -5701,8 +6012,10 @@ def llama_set_embeddings_layer_inp(
     lid: ctypes.c_uint32,
     value: bool,
 ) -> None:  # type: ignore
-    """
-    Set whether the context outputs the input embeddings of a specific layer
+    """Enable or disable capture of input embeddings for layer lid.
+
+    Set this before evaluation, using a valid zero-based model layer index.
+    DFlash uses these intermediate embeddings to condition its draft model.
     """
     ...
 
@@ -5724,6 +6037,12 @@ def llama_get_embeddings_layer_inp(
     ctx: llama_context_p,
     lid: ctypes.c_uint32,
 ) -> ctypes.POINTER(ctypes.c_float):  # type: ignore
+    """Return captured input embeddings for zero-based layer lid.
+
+    Capture must be enabled and the layer evaluated before this call; the
+    native implementation asserts that the output exists. The context owns
+    the buffer, which must be copied before another evaluation or teardown.
+    """
     ...
 
 # LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
@@ -5741,6 +6060,11 @@ def llama_get_embeddings_layer_inp(
 def llama_get_ctx_other(
     ctx: llama_context_p,
 ) -> llama_context_p:
+    """Return the related context configured through ctx_other, or NULL.
+
+    This is a borrowed handle used by paired speculative contexts. This call
+    does not create a context or transfer responsibility for freeing it.
+    """
     ...
 
 # // model/context data extraction
@@ -5760,7 +6084,7 @@ def llama_get_ctx_other(
 def llama_model_dflash_selector_top_k(
     model: llama_model_p
 ) -> int:
-    """return the DFlash2 selector width, or zero for DFlash v1/DSpark."""
+    """Return the DFlash2 selector width, or zero for DFlash v1/DSpark."""
     ...
 
 # // returns pointer to the target-model layer indices
@@ -5779,8 +6103,11 @@ def llama_model_dflash_selector_top_k(
 def llama_model_target_layer_ids(
     model: llama_model_p
 ) -> ctypes.POINTER(ctypes.c_int32):  # type: ignore
-    """
-    returns pointer to the target-model layer indices
+    """Return the target layer indices required by this draft model.
+
+    Read llama_model_target_layer_ids_n(model) int32 entries. The returned
+    array belongs to the model and must not be freed or modified. An empty
+    array returns NULL; copy it before freeing the model.
     """
     ...
 
@@ -5800,8 +6127,9 @@ def llama_model_target_layer_ids(
 def llama_model_target_layer_ids_n(
     model: llama_model_p
 ) -> int:
-    """
-    returns the number of extracted layers from target model
+    """Return the number of entries in llama_model_target_layer_ids(model).
+
+    Zero means the model does not specify target layer indices.
     """
     ...
 
@@ -5825,10 +6153,59 @@ def llama_model_get_tok_embd(
     model: llama_model_p,
     out: Optional[ctypes.POINTER(ctypes.c_float)],  # type: ignore
 ) -> int:
+    """Copy the model's token embedding matrix into caller-owned F32 storage.
+
+    Pass out=None to query the required number of floats, then allocate at
+    least that many c_float entries and call again to fill them. The matrix
+    contains n_embd * n_vocab elements, not merely n_vocab elements.
+
+    Returns:
+        The number of float elements, or zero when the matrix is unavailable
+        or cannot be converted. The caller retains ownership of out.
     """
-    retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
-    returns total number of elements or 0 on error
-    if out is nullptr, returns the number of tokens without writing to out
-    caller must allocate enough memory for out before calling
+    ...
+
+
+# LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model,
+#         const llama_token * tokens, uint32_t n_tokens, float * out);
+@ctypes_function_llama_ext(
+    [
+        "llama_model_get_tok_embd_rows",
+        "?llama_model_get_tok_embd_rows@@YAIPEBUllama_model@@PEBHIPEAM@Z",
+        "__Z29llama_model_get_tok_embd_rowsPK11llama_modelPKijPf",
+        "_Z29llama_model_get_tok_embd_rowsPK11llama_modelPKijPf",
+    ],
+    [llama_model_p_ctypes, llama_token_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)],
+    ctypes.c_uint32,
+    required=False,
+)
+def llama_model_get_tok_embd_rows(
+    model: llama_model_p,
+    tokens: CtypesArray[llama_token],
+    n_tokens: int,
+    out: CtypesArray[ctypes.c_float],
+) -> int:
+    """Copy token embedding rows into caller-owned F32 storage, in token order.
+
+    Allocate n_tokens * llama_model_n_embd(model) floats for out. These are
+    token rows, without multimodal deepstack features. Return the number of
+    floats written, or 0 on error; NULL out is not a size query.
     """
+    ...
+
+
+# LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+@ctypes_function_llama_ext(
+    [
+        "llama_model_n_tokens_delay",
+        "?llama_model_n_tokens_delay@@YAIPEBUllama_model@@@Z",
+        "__Z26llama_model_n_tokens_delayPK11llama_model",
+        "_Z26llama_model_n_tokens_delayPK11llama_model",
+    ],
+    [llama_model_p_ctypes],
+    ctypes.c_uint32,
+    required=False,
+)
+def llama_model_n_tokens_delay(model: llama_model_p) -> int:
+    """Return realtime audio output delay in tokens, or 0 when not applicable."""
     ...

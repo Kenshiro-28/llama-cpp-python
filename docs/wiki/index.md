@@ -29,7 +29,8 @@ vendored `llama.cpp` APIs remain the source of truth.
 | Page | Description |
 |---|---|
 | [Llama Cache](modules/LlamaCache.md) | Cache interfaces and implementations for reusing model state across repeated prompts. |
-| [Llama Embedding](modules/LlamaEmbedding.md) | Dedicated embedding APIs, configuration, output formats, and batching behavior. |
+| [Llama Embedding](modules/LlamaEmbedding.md) | Text and multimodal embedding APIs, projector configuration, output formats, and batching behavior. |
+| [Llama Batch](modules/LlamaBatch.md) | Internal batch builders, per-entry inputs, range submission, output indices, and resource ownership. |
 | [Llama Grammar](modules/LlamaGrammar.md) | Grammar definitions, custom roots, lazy triggers, JSON Schema conversion, errors, and sampler ownership. |
 | [Llama Speculative Decoding](modules/LlamaSpeculative.md) | Stateful MTP, DFlash, DFlash2, DSpark, and n-gram engines; configuration, lifecycle, rollback, statistics, and benchmarks. |
 | [Logger](modules/Logger.md) | Python and native logging configuration, callbacks, levels, filtering, and output routing. |
@@ -41,7 +42,7 @@ vendored `llama.cpp` APIs remain the source of truth.
 | Page | Description |
 |---|---|
 | [Caching and State Reuse](features/caching.md) | Live prefixes, full snapshots, partial checkpoints, ownership, and cache misses. |
-| [Embeddings and Reranking](features/embeddings-rerank.md) | End-to-end sentence embeddings, token-level vectors, normalization, streaming batches, similarity output, and cross-encoder reranking. |
+| [Embeddings and Reranking](features/embeddings-rerank.md) | Sentence and text/image/audio embeddings, token-level vectors, normalization, streaming batches, similarity output, and cross-encoder reranking. |
 | [Grammar and Constrained Generation](features/grammar.md) | GBNF and JSON Schema usage, reusable definitions, lazy sampling, conversion optimizations, and supported behavior and limitations. |
 | [RPC Model Offloading](features/rpc.md) | Build and start an RPC backend, select remote and local devices, handle registration failures, and use multimodal models. |
 
@@ -123,6 +124,7 @@ Completed pages currently linked from this index:
 - `core/Llama.md`
 - `modules/LlamaCache.md`
 - `modules/LlamaEmbedding.md`
+- `modules/LlamaBatch.md`
 - `modules/LlamaGrammar.md`
 - `modules/LlamaSpeculative.md`
 - `modules/Logger.md`

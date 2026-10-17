@@ -11,7 +11,7 @@ import threading
 import zlib
 import wave
 
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing_extensions import Self
 from typing import (
@@ -21,6 +21,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Union,
     Protocol,
@@ -29,6 +30,7 @@ from typing import (
 )
 
 import urllib.request
+import numpy as np
 from urllib.error import URLError, HTTPError
 
 import llama_cpp.llama_cpp as llama_cpp_lib
@@ -47,6 +49,34 @@ from llama_cpp.llama_chat_format import (
     ImmutableSandboxedEnvironment,
     Jinja2ChatFormatter,
 )
+
+@dataclass(frozen=True)
+class MTMDEncodedChunk:
+    """Owned text tokens or projected features, with absolute decoder positions."""
+
+    kind: int
+    tokens: Tuple[int, ...]
+    embeddings: Optional[np.ndarray]
+    positions: Tuple[Any, ...]
+    n_pos: int
+    use_non_causal: bool
+
+
+class MTMDInputChunks:
+    """Request-scoped native chunks; encode() returns independently owned data."""
+
+    def __init__(self, handler, chunks):
+        self._handler = handler
+        self._chunks = chunks
+        self.n_tokens = handler._mtmd_cpp.mtmd_helper_get_n_tokens(chunks)
+        self.n_pos = handler._mtmd_cpp.mtmd_helper_get_n_pos(chunks)
+
+    def encode(self) -> Tuple[MTMDEncodedChunk, ...]:
+        """Copy tokens, media features and positions before native resources expire."""
+        if self._handler is None:
+            raise RuntimeError("MTMD chunks are outside their owning request")
+        return self._handler.encode(self)
+
 
 class MTMDBaseHandler:
     """Shared mtmd configuration, context lifecycle, and media loading."""
@@ -186,11 +216,20 @@ class MTMDBaseHandler:
         self.is_support_video = False
 
         self._exit_stack = ExitStack()
+        self._mtmd_lock = threading.RLock()
+        self._active_requests = 0
+        self._closed = False
+        self._bound_model = None
 
     def _init_mtmd_context(self, llama_model: llama_core.Llama):
         """Initialize mtmd context with the llama model."""
+        self._require_model_open(llama_model)
+        if self._closed:
+            raise RuntimeError("MTMD handler is closed")
         if self.mtmd_ctx is not None:
-            return  # Already initialized
+            if self._bound_model is not None and self._bound_model is not llama_model:
+                raise ValueError("MTMD handler is bound to a different Llama model")
+            return
 
         self._mtmd_cpp.mtmd_helper_log_set(ggml_log_callback, ctypes.c_void_p(0))
 
@@ -228,6 +267,8 @@ class MTMDBaseHandler:
 
         if self.mtmd_ctx is None:
             raise ValueError(f"{self.log_prefix}(_init_mtmd_context): Failed to load mtmd context from: {self.mmproj_path}")
+        self._bound_model = llama_model
+        self.media_marker = self._mtmd_cpp.mtmd_get_marker(self.mtmd_ctx).decode("utf-8")
 
         # Check if vision is supported
         self.is_support_vision = self._mtmd_cpp.mtmd_support_vision(self.mtmd_ctx)
@@ -258,23 +299,205 @@ class MTMDBaseHandler:
 
     def close(self) -> None:
         """Explicitly free the shared mtmd resources."""
+        with getattr(self, "_mtmd_lock", ExitStack()):
+            if getattr(self, "_active_requests", 0):
+                raise RuntimeError("Cannot close MTMD handler inside an active request")
+            self._close_resources()
+
+    def _close_resources(self) -> None:
         cleanup = getattr(self, "_exit_stack", None)
         self._exit_stack = None
+        self._closed = True
+        self._bound_model = None
+        self.mctx_params = None
         try:
             # Dependent resources must be freed before the mtmd context.
             if cleanup is not None:
                 cleanup.close()
         finally:
             if getattr(self, "mtmd_ctx", None) is not None:
-                try:
-                    self._mtmd_cpp.mtmd_free(self.mtmd_ctx)
-                    self.mtmd_ctx = None
-                except Exception:
-                    pass
-            self.mctx_params = None
+                ctx, self.mtmd_ctx = self.mtmd_ctx, None
+                self._mtmd_cpp.mtmd_free(ctx)
+
+    @staticmethod
+    def _require_model_open(model) -> None:
+        if hasattr(model, "_ctx") and (model._ctx is None or not model._ctx.ctx):
+            raise RuntimeError("Llama model is closed")
 
     def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> Self:
+        """Return this handler; initialization remains lazy."""
+        if self._closed:
+            raise RuntimeError("MTMD handler is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        """Release the projector and its dependent resources."""
         self.close()
+
+    def tokenize_parts(self, model: llama_core.Llama, parts: Sequence[Union[str, bytes]],
+                       *, add_special: bool = True, parse_special: bool = True):
+        """Tokenize ordered str/bytes parts without manually inserting media markers."""
+        return self.tokenize(model, None, parts=parts, add_special=add_special,
+                             parse_special=parse_special)
+
+    @contextmanager
+    def tokenize(self, model: llama_core.Llama, prompt: Optional[str],
+                 media: Sequence[bytes] = (), *, parts: Optional[Sequence[Union[str, bytes]]] = None,
+                 add_special: bool = True, parse_special: bool = True):
+        """Yield scoped chunks from text/ordered media bytes, or explicit str/bytes parts.
+
+        Text prompts need one native media marker per payload. Special-token flags
+        apply to text; video bytes require the existing chat video pipeline.
+        The model and handler must stay open and must not be used concurrently.
+        """
+        with self._mtmd_lock:
+            self._init_mtmd_context(model)
+            if parts is not None and (prompt is not None or media):
+                raise ValueError("Use either prompt/media or parts")
+            self._active_requests += 1
+            request = None
+            try:
+                with ExitStack() as cleanup:
+                    native = self._mtmd_cpp
+
+                    def bitmap(payload):
+                        image, video = self._create_bitmap_from_bytes(payload)
+                        if video:
+                            cleanup.callback(native.mtmd_helper_video_free, video)
+                        if image:
+                            cleanup.callback(native.mtmd_bitmap_free, image)
+                        if video:
+                            raise ValueError("Video bytes require frame/timestamp processing")
+                        is_audio = native.mtmd_bitmap_is_audio(image)
+                        if is_audio and not self.is_support_audio:
+                            raise ValueError("MTMD projector does not support audio input")
+                        if not is_audio and not self.is_support_vision:
+                            raise ValueError("MTMD projector does not support image input")
+                        return image
+
+                    texts, native_parts, bitmaps = [], [], []
+                    if parts is not None:
+                        for part in parts:
+                            if isinstance(part, str):
+                                encoded = part.encode("utf-8")
+                                text = native.mtmd_input_text(encoded, len(encoded), False, parse_special)
+                                texts.append(text)
+                                native_parts.append(native.mtmd_input_part(ctypes.pointer(text), None))
+                            elif isinstance(part, bytes):
+                                native_parts.append(native.mtmd_input_part(None, bitmap(part)))
+                            else:
+                                raise TypeError("parts must contain text strings or media bytes")
+                    else:
+                        bitmaps = [bitmap(payload) for payload in media]
+                    chunks = native.mtmd_input_chunks_init()
+                    if not chunks:
+                        raise MemoryError("Cannot allocate MTMD chunks")
+                    cleanup.callback(native.mtmd_input_chunks_free, chunks)
+                    if parts is not None:
+                        pointers = (native.mtmd_input_part_p_ctypes * len(native_parts))(
+                            *(ctypes.pointer(part) for part in native_parts))
+                        status = native.mtmd_tokenize_from_parts(self.mtmd_ctx, chunks, pointers,
+                                                                 len(native_parts), add_special)
+                    else:
+                        if not isinstance(prompt, str):
+                            raise TypeError("prompt must be a text string")
+                        encoded = prompt.encode("utf-8")
+                        text = native.mtmd_input_text(encoded, len(encoded), add_special, parse_special)
+                        pointers = (native.mtmd_bitmap_p_ctypes * len(bitmaps))(*bitmaps)
+                        status = native.mtmd_tokenize(self.mtmd_ctx, chunks, ctypes.byref(text),
+                                                      pointers, len(bitmaps))
+                    if status != 0:
+                        raise ValueError(f"MTMD tokenization failed: {status}; check media markers")
+                    request = MTMDInputChunks(self, chunks)
+                    yield request
+            finally:
+                if request is not None:
+                    request._chunks = None
+                    request._handler = None
+                self._active_requests -= 1
+
+    def encode(self, request: MTMDInputChunks) -> Tuple[MTMDEncodedChunk, ...]:
+        """Encode compatible media batches and copy results in original chunk order."""
+        with self._mtmd_lock:
+            if request._handler is not self or request._chunks is None or self._closed:
+                raise RuntimeError("MTMD chunks are outside their owning request")
+            self._require_model_open(self._bound_model)
+            native = self._mtmd_cpp
+            chunks = [native.mtmd_input_chunks_get(request._chunks, i)
+                      for i in range(native.mtmd_input_chunks_size(request._chunks))]
+            result, pending = {}, []
+            position = 0
+            mrope = native.mtmd_decode_use_mrope(self.mtmd_ctx)
+            with ExitStack() as cleanup:
+                batch = None
+
+                def flush():
+                    nonlocal batch
+                    if not pending:
+                        return
+                    if native.mtmd_batch_encode(batch) != 0:
+                        raise RuntimeError("MTMD media batch encoding failed")
+                    width = self._bound_model.n_embd_inp()
+                    for index, chunk in pending:
+                        ptr = native.mtmd_batch_get_output_embd(batch, chunk)
+                        if not ptr:
+                            raise RuntimeError("MTMD returned no projected features")
+                        count = native.mtmd_input_chunk_get_n_tokens(chunk)
+                        features = np.ctypeslib.as_array(ptr, shape=(count * width,)).reshape(count, width).copy()
+                        features.setflags(write=False)
+                        kind, positions, n_pos, non_causal = result[index]
+                        result[index] = MTMDEncodedChunk(kind, (), features, positions, n_pos, non_causal)
+                    pending.clear()
+                    cleanup.pop_all().close()
+                    batch = None
+
+                for index, chunk in enumerate(chunks):
+                    kind = native.mtmd_input_chunk_get_type(chunk)
+                    count = native.mtmd_input_chunk_get_n_tokens(chunk)
+                    n_pos = native.mtmd_input_chunk_get_n_pos(chunk)
+                    non_causal = native.mtmd_decode_use_non_causal(self.mtmd_ctx, chunk)
+                    positions = tuple(range(position, position + count))
+                    # Native batch_ext token entries take one scalar position,
+                    # including M-RoPE models; only media entries carry axes.
+                    if mrope and not self._is_text_chunk(kind):
+                        if self._is_image_chunk(kind):
+                            image = native.mtmd_input_chunk_get_tokens_image(chunk)
+                            coords = [native.mtmd_image_tokens_get_decoder_pos(image, position, i)
+                                      for i in range(count)]
+                            positions = tuple((p.t, p.y, p.x, p.z) for p in coords)
+                        else:
+                            positions = tuple((p, p, p, p) for p in positions)
+                    if self._is_text_chunk(kind):
+                        length = ctypes.c_size_t()
+                        tokens = native.mtmd_input_chunk_get_tokens_text(chunk, ctypes.byref(length))
+                        result[index] = MTMDEncodedChunk(kind, tuple(tokens[:length.value]), None, positions, n_pos, non_causal)
+                    else:
+                        result[index] = (kind, positions, n_pos, non_causal)
+                        if batch is None:
+                            batch = native.mtmd_batch_init(self.mtmd_ctx)
+                            if not batch:
+                                raise MemoryError("Cannot allocate MTMD media batch")
+                            cleanup.callback(native.mtmd_batch_free, batch)
+                        status = native.mtmd_batch_add_chunk(batch, chunk)
+                        if status in (2, 3) and pending:
+                            flush()
+                            batch = native.mtmd_batch_init(self.mtmd_ctx)
+                            if not batch:
+                                raise MemoryError("Cannot allocate MTMD media batch")
+                            cleanup.callback(native.mtmd_batch_free, batch)
+                            status = native.mtmd_batch_add_chunk(batch, chunk)
+                        if status != 0:
+                            raise RuntimeError(f"MTMD media batch insertion failed: {status}")
+                        pending.append((index, chunk))
+                    position += n_pos
+                flush()
+            return tuple(result[i] for i in range(len(chunks)))
 
     def _create_bitmap_from_bytes(self, media_bytes: bytes):
         """
@@ -611,6 +834,90 @@ class MTMDBaseHandler:
             **kwargs,
         )
 
+
+
+class MTMDEmbeddingHandler(MTMDBaseHandler):
+    """Pool text/image/audio without chat templates or generation state.
+
+    Preserves the model's attention mode and requires MEAN, CLS or LAST pooling.
+    The whole input must fit one decoder microbatch; media encoding batches are
+    separate. Chunk-local bidirectional attention in a causal model is unsupported.
+    """
+
+    def embed(self, model: llama_core.Llama, prompt: Optional[str] = None,
+              media: Sequence[bytes] = (), *, parts: Optional[Sequence[Union[str, bytes]]] = None,
+              normalize: Union[bool, int] = 2, return_count: bool = False):
+        """Return a pooled vector, optionally with token count.
+
+        prompt (str): Text with one native marker per image/audio in media (bytes).
+        parts (sequence[str/bytes]): Ordered input instead of prompt/media.
+        normalize (bool/int): llama.cpp normalization mode, default L2 (2).
+        return_count (bool): Include the total text and media token count.
+        The projector initializes lazily; unavailable backends or unsupported
+        models/media raise before encoding or decoding.
+        """
+        from ._internals import LlamaBatchExt
+        from ._utils import normalize_embedding
+
+        if getattr(self, "_closed", True):
+            raise RuntimeError("MTMD embedding handler is not initialized or has been closed")
+        with self._mtmd_lock:
+            ctx = getattr(model, "_ctx", None)
+            if ctx is None or not ctx.ctx:
+                raise RuntimeError("Llama model is not initialized or has been closed")
+            params = getattr(model, "context_params", None)
+            if (params is None or not params.embeddings
+                    or ctx.pooling_type() not in (llama_cpp_lib.LLAMA_POOLING_TYPE_MEAN,
+                                                 llama_cpp_lib.LLAMA_POOLING_TYPE_CLS,
+                                                 llama_cpp_lib.LLAMA_POOLING_TYPE_LAST)):
+                raise ValueError("Use an embedding model with MEAN, CLS or LAST pooling")
+            if not isinstance(normalize, int):
+                raise TypeError("normalize must be a bool or int")
+            # Native symbols are checked when importing MTMD; initialization checks binding.
+            self._init_mtmd_context(model)
+            if not (self.is_support_vision or self.is_support_audio):
+                raise ValueError("MTMD projector does not support image or audio embeddings")
+            with self.tokenize(model, prompt, media, parts=parts) as request:
+                limit = min(model.n_ctx(), model._ctx.n_batch(), model._ctx.n_ubatch())
+                if not 0 < request.n_tokens <= limit or request.n_pos > model.n_ctx():
+                    raise ValueError(f"Full multimodal input ({request.n_tokens} tokens) must fit one microbatch ({limit})")
+                model.reset()
+                try:
+                    # No native getter exists for this mutable mode; ensure output is enabled.
+                    model._ctx.set_embeddings(True)
+                    encoded = request.encode()
+                    if ctx.get_causal_attn() and any(
+                        chunk.embeddings is not None and chunk.use_non_causal
+                        for chunk in encoded
+                    ):
+                        # The native media helper switches attention per chunk.
+                        # Splitting this decode would change pooled MEAN/CLS
+                        # semantics; disabling causal attention globally would
+                        # also change the text model's semantics.
+                        raise NotImplementedError(
+                            "Pooled multimodal embeddings do not support media requiring "
+                            "chunk-local non-causal attention in a causal model"
+                        )
+                    with LlamaBatchExt(context=model._ctx) as batch:
+                        for chunk in encoded:
+                            if chunk.embeddings is None:
+                                batch.add_tokens(chunk.tokens, positions=chunk.positions,
+                                                 outputs=[True] * len(chunk.tokens))
+                            else:
+                                batch.add_embeddings(chunk.embeddings, positions=chunk.positions,
+                                                     outputs=[True] * len(chunk.embeddings))
+                        if model._ctx.decode(batch) != 0:
+                            raise RuntimeError("Multimodal embedding decode failed")
+                        ptr = model._ctx.get_embeddings_seq(0)
+                        if not ptr:
+                            raise RuntimeError("Model returned no pooled embedding")
+                        vector = np.ctypeslib.as_array(ptr, shape=(model.n_embd_out(),)).copy()
+                        if not np.isfinite(vector).all():
+                            raise RuntimeError("Model returned a non-finite embedding")
+                        values = normalize_embedding(vector.tolist(), normalize)
+                        return (values, request.n_tokens) if return_count else values
+                finally:
+                    model.reset()
 
 
 @dataclass(frozen=True)
@@ -1767,6 +2074,7 @@ class MTMDChatHandler(MTMDBaseHandler):
         )
 
         prefill_started = False
+        media_callback = getattr(llama.speculative, "process_media", None)
         try:
             if self.verbose:
                 print(f"{self.log_prefix}(__call__): Prepared virtual token ledger of length {len(full_prompt_ids)}.", file=sys.stderr)
@@ -1776,9 +2084,15 @@ class MTMDChatHandler(MTMDBaseHandler):
             ):
                 raise NotImplementedError(
                     "This speculative engine cannot consume MTMD prefilled prompts; "
-                    "use NGRAM_MAP_K/K4V or disable speculative decoding for this handler"
+                    "use MTP or NGRAM_MAP_K/K4V, or disable speculative decoding for this handler"
                 )
             prefill_started = True
+            if media_callback is not None:
+                # Public prompt checkpoints contain only target state. MTP also
+                # needs its draft context and pending NextN row reconstructed.
+                llama.reset()
+                if len(full_prompt_ids) > llama.n_ctx():
+                    raise ValueError("MTMD speculative prompt exceeds n_ctx; increase n_ctx")
             llama._last_eval_output_start = 0
             llama._last_eval_output_count = 0
             llama._prefilled_prompt = None
@@ -1869,6 +2183,8 @@ class MTMDChatHandler(MTMDBaseHandler):
 
                     # Stage 5: Multimodal Physical OOM Defense
                     if n_past + chunk_n_tokens > llama.n_ctx():
+                        if media_callback is not None:
+                            raise ValueError("MTMD speculative media exceeds n_ctx; increase n_ctx")
                         if not llama._ctx.memory_can_shift():
                             raise RuntimeError(
                                 f"{self.log_prefix}(__call__): Context Shift is explicitly disabled by the C++ backend "
@@ -1905,22 +2221,43 @@ class MTMDChatHandler(MTMDBaseHandler):
                             n_past -= n_discard
                             llama.n_tokens = n_past
 
-                    # Execute C++ Multimodal Black-box Extraction
+                    # Decode media and consume each target sub-batch before the
+                    # helper reuses its embedding and position buffers.
                     new_n_past = llama_cpp_lib.llama_pos(0)
-                    result = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
-                        self.mtmd_ctx,
-                        llama._ctx.ctx,
-                        chunk_ptr,
-                        llama_cpp_lib.llama_pos(n_past),
-                        llama_cpp_lib.llama_seq_id(0),
-                        llama.n_batch,
-                        True, # logits_last = True, drastically saves computational overhead
-                        ctypes.byref(new_n_past)
-                    )
+                    if media_callback is None:
+                        result = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
+                            self.mtmd_ctx, llama._ctx.ctx, chunk_ptr,
+                            llama_cpp_lib.llama_pos(n_past), llama_cpp_lib.llama_seq_id(0),
+                            llama.n_batch, True, ctypes.byref(new_n_past),
+                        )
+                    else:
+                        result = self._mtmd_cpp.mtmd_encode_chunk(self.mtmd_ctx, chunk_ptr)
+                        if result == 0:
+                            callback_errors = []
+
+                            @self._mtmd_cpp.mtmd_helper_post_decode_callback
+                            def post_decode(batch, user_data):
+                                # ctypes cannot propagate exceptions across C.
+                                # Abort native batching and re-raise after return.
+                                try:
+                                    media_callback(batch.contents)
+                                except BaseException as exc:
+                                    callback_errors.append(exc)
+                                    return -1
+                                return 0
+
+                            result = self._mtmd_cpp.mtmd_helper_decode_image_chunk(
+                                self.mtmd_ctx, llama._ctx.ctx, chunk_ptr,
+                                self._mtmd_cpp.mtmd_get_output_embd(self.mtmd_ctx),
+                                llama_cpp_lib.llama_pos(n_past), llama_cpp_lib.llama_seq_id(0),
+                                llama.n_batch, ctypes.byref(new_n_past), post_decode, None,
+                            )
+                            if callback_errors:
+                                raise callback_errors[0]
 
                     if result != 0:
                         message = (
-                            f"{self.log_prefix}(mtmd_helper_eval_chunk_single): "
+                            f"{self.log_prefix}(media prefill): "
                             f"Media evaluation failed with error code {result} "
                             f"(start_pos={n_past}, media_tokens={chunk_n_tokens}, "
                             f"n_ctx={llama.n_ctx()}, n_batch={llama.n_batch})."
@@ -1938,7 +2275,7 @@ class MTMDChatHandler(MTMDBaseHandler):
                         raise ValueError(message)
 
                     if not n_past <= new_n_past.value <= llama.n_ctx():
-                        raise ValueError(f"{self.log_prefix}(mtmd_helper_eval_chunk_single): Invalid output position {new_n_past.value}.")
+                        raise ValueError(f"{self.log_prefix}(media prefill): Invalid output position {new_n_past.value}.")
 
                     # Update Ledger with "Negative Reverse Vocabulary" IDs
                     llama.input_ids[n_past : new_n_past.value] = media_id
@@ -1966,6 +2303,7 @@ class MTMDChatHandler(MTMDBaseHandler):
             # Anchors the state ONLY after the entire multi-modal turn is processed
             if (
                 llama.is_hybrid
+                and media_callback is None
                 and llama._hybrid_cache_mgr is not None
                 and llama._hybrid_cache_mgr.max_checkpoints > 0
             ):

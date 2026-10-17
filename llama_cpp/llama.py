@@ -82,7 +82,7 @@ from ._logger import (
     clear_log_filters,
     reset_log_filters,
 )
-from ._utils import suppress_stdout_stderr
+from ._utils import suppress_stdout_stderr, normalize_embedding
 
 
 def _format_speculative_duration(seconds: float) -> str:
@@ -157,6 +157,7 @@ class Llama:
         n_rs_seq: int = 0,
         n_outputs_max: int = 0,
         n_outputs_max_per_seq: int = 1,
+        moe_cache_size: int = 0,
         n_threads: Optional[int] = None,
         n_threads_batch: Optional[int] = None,
         ctx_type: int = llama_cpp_lib.llama_context_type.LLAMA_CONTEXT_TYPE_DEFAULT,
@@ -307,6 +308,9 @@ class Llama:
                 arguments, including draft length, probability threshold,
                 draft model, cache types and backend sampling.
             tokenizer: Optional tokenizer to override the default tokenizer from llama.cpp.
+            moe_cache_size: Device cache size in bytes for MoE experts kept in host memory,
+                split among devices like layers. Requires a GPU and MoE model;
+                tensor parallelism is unsupported. 0 disables caching. Experimental.
             type_k: KV cache data type for K (default: f16)
             type_v: KV cache data type for V (default: f16)
             spm_infill: Use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this.
@@ -341,6 +345,8 @@ class Llama:
         self.verbose = verbose
         self.verbosity = verbosity
         self._stack = contextlib.ExitStack()
+        if moe_cache_size < 0:
+            raise ValueError("moe_cache_size must be nonnegative")
         self.rpc_servers = normalize_rpc_servers(rpc_servers)
         if isinstance(rpc_local_devices, (str, bytes)):
             raise TypeError("rpc_local_devices must be a sequence of device names")
@@ -577,6 +583,7 @@ class Llama:
 
         # Context Params
         self.context_params = llama_cpp_lib.llama_context_default_params()
+        self.context_params.moe_cache_size = moe_cache_size
         self.context_params.n_ctx = n_ctx
         self.context_params.n_batch = self.n_batch
         self.context_params.n_ubatch = min(self.n_batch, n_ubatch)
@@ -3131,6 +3138,9 @@ class Llama:
 
         ctx = self._ctx.ctx
         n_batch = self.n_batch
+        # Bidirectional attention must see the entire input in one microbatch.
+        if not self._ctx.get_causal_attn():
+            n_batch = min(n_batch, self._ctx.n_ubatch())
         n_ctx = self._n_ctx
         n_seq_max = self.context_params.n_seq_max
 
@@ -3142,7 +3152,7 @@ class Llama:
         out_dim = (
             llama_cpp_lib.llama_model_n_cls_out(self._model.model)
             if is_rank
-            else self.n_embd()
+            else self.n_embd_out()
         )
 
         # Preserve the historical bool API while accepting llama.cpp's integer
@@ -3156,43 +3166,7 @@ class Llama:
             raise TypeError("normalize must be a bool or int")
 
         def normalize_vector(vector: Sequence[float]) -> List[float]:
-            values = list(vector)
-            # -1 (NONE): preserve the original vector. RANK always preserves
-            # raw classification scores regardless of the requested mode.
-            if normalize_mode == -1 or is_rank:
-                return values
-
-            array = np.asarray(values, dtype=np.float32)
-            # Compute y = scale * x / norm(x).
-            if normalize_mode == 0:
-                # 0 (MAX_INT16): y = 32760 * x / max(abs(x)). The result
-                # remains floating point; this is scaling, not int16 quantization.
-                norm = float(np.max(np.abs(array))) if array.size else 0.0
-                scale = 32760.0
-            elif normalize_mode == 1:
-                # 1 (TAXICAB / L1): y = x / sum(abs(x)).
-                norm = float(np.sum(np.abs(array)))
-                scale = 1.0
-            elif normalize_mode == 2:
-                # 2 (EUCLIDEAN / L2): y = x / sqrt(sum(x_i ** 2)).
-                norm = float(np.linalg.norm(array))
-                scale = 1.0
-            elif normalize_mode > 2:
-                # p > 2 (PNORM): y = x / (sum(abs(x_i) ** p)) ** (1/p).
-                # The mode itself is p; NORM_MODE_PNORM = 6 selects the L6 norm.
-                norm = float(
-                    np.sum(np.abs(array) ** normalize_mode)
-                    ** (1.0 / normalize_mode)
-                )
-                scale = 1.0
-            else:
-                # Other negative modes retain the existing passthrough behavior.
-                return values
-
-            # Zero vectors remain zero rather than producing NaNs on division.
-            if norm == 0.0:
-                return values
-            return ((array / norm) * scale).tolist()
+            return list(vector) if is_rank else normalize_embedding(vector, normalize_mode)
 
         if isinstance(input, str):
             inputs: List[Union[str, List[int]]] = (
@@ -4641,6 +4615,7 @@ prompt: The prompt to generate text from.
             n_rs_seq=self.context_params.n_rs_seq,
             n_outputs_max=self.context_params.n_outputs_max,
             n_outputs_max_per_seq=self.context_params.n_outputs_max_per_seq,
+            moe_cache_size=self.context_params.moe_cache_size,
             n_threads=self.context_params.n_threads,
             n_threads_batch=self.context_params.n_threads_batch,
             ctx_type=self.context_params.ctx_type,
