@@ -217,6 +217,10 @@ class LlamaVocabType(enum.IntEnum):
 #     LLAMA_VOCAB_PRE_TYPE_SPARK2_5          = 58,
 #     LLAMA_VOCAB_PRE_TYPE_UFAKZEKA          = 59,
 #     LLAMA_VOCAB_PRE_TYPE_MMBERT            = 60,
+#     LLAMA_VOCAB_PRE_TYPE_K2_HORIZON        = 61,
+#     LLAMA_VOCAB_PRE_TYPE_FLINT             = 62,
+#     LLAMA_VOCAB_PRE_TYPE_DOMYN_SMALL       = 63,
+#     LLAMA_VOCAB_PRE_TYPE_NEMOTRON_3_5_EMBD = 64,
 # };
 class llama_vocab_pre_type(enum.IntEnum):
     LLAMA_VOCAB_PRE_TYPE_DEFAULT = 0
@@ -280,6 +284,11 @@ class llama_vocab_pre_type(enum.IntEnum):
     LLAMA_VOCAB_PRE_TYPE_SPARK2_5 = 58
     LLAMA_VOCAB_PRE_TYPE_UFAKZEKA = 59
     LLAMA_VOCAB_PRE_TYPE_MMBERT = 60
+    LLAMA_VOCAB_PRE_TYPE_K2_HORIZON = 61
+    LLAMA_VOCAB_PRE_TYPE_FLINT = 62
+    LLAMA_VOCAB_PRE_TYPE_DOMYN_SMALL = 63
+    LLAMA_VOCAB_PRE_TYPE_NEMOTRON_3_5_EMBD = 64
+
 
 
 # // note: these values should be synchronized with ggml_rope
@@ -970,7 +979,7 @@ llama_sampler_seq_config_p = ctypes.POINTER(llama_sampler_seq_config)
 #     void *              abort_callback_data;
 
 #     // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
-#     bool embeddings;  // if true, extract embeddings (together with logits)
+#     bool embeddings;  // if true, extract embeddings (together with logits, except for a pooling type other than NONE)
 #     bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
 #     bool no_perf;     // measure performance timings
 #     bool op_offload;  // offload host tensor operations to device
@@ -1030,7 +1039,7 @@ class llama_context_params(ctypes.Structure):
         abort_callback (ggml_abort_callback): abort callback if it returns true, execution of llama_decode() will be aborted
         abort_callback_data (ctypes.ctypes.c_void_p): data for abort_callback
 
-        embeddings (bool): if true, extract embeddings (together with logits)
+        embeddings (bool): if true, extract embeddings (together with logits, except for a pooling type other than NONE)
         offload_kqv (bool): whether to offload the KQV ops (including the KV cache) to GPU
         no_perf (bool): whether to measure performance timings
         op_offload(bool): whether to offload host tensor operations to device
@@ -3330,6 +3339,8 @@ def llama_batch_ext_set_embd_token(batch: llama_batch_ext_p, idx: int, embd: lla
 # // "state" here means extra hidden state carried over from a previous stage, e.g.:
 # //   - MTP: state from N layers of the target model
 # //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
+# //   - LiliCorr: context embeddings for the transformers
+# // Returns false if the context does not take a state embedding (MTP and LiliCorr contexts do)
 # LLAMA_API bool llama_batch_ext_set_embd_state(
 #                             struct llama_batch_ext * batch,
 #                                             int32_t   idx,
