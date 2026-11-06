@@ -95,6 +95,7 @@ class MTMDBaseHandler:
         video_ffmpeg_bin_dir: Optional[Union[str, os.PathLike[str]]] = None,
         video_timestamp_interval_ms: Optional[int] = None,
         flash_attn: Optional[bool] = None,
+        video_no_soundtrack: Optional[bool] = None,
         **kwargs
     ):
 
@@ -140,6 +141,8 @@ class MTMDBaseHandler:
         if flash_attn is not None and not isinstance(flash_attn, bool):
             raise TypeError("flash_attn must be bool or None")
         self.flash_attn = flash_attn
+        if video_no_soundtrack is not None and not isinstance(video_no_soundtrack, bool):
+            raise TypeError("video_no_soundtrack must be bool or None")
 
         import llama_cpp.mtmd_cpp as mtmd_cpp
         self._mtmd_cpp = mtmd_cpp
@@ -149,6 +152,7 @@ class MTMDBaseHandler:
             video_fps_target,
             video_ffmpeg_bin_dir,
             video_timestamp_interval_ms,
+            video_no_soundtrack,
         )
         if mtmd_helper_init_opt is not None and any(
             value is not None for value in video_overrides
@@ -169,6 +173,8 @@ class MTMDBaseHandler:
         else:
             self._mtmd_helper_init_opt = mtmd_cpp.mtmd_helper_init_opt_default()
             self._video_ffmpeg_bin_dir_bytes = None
+            if video_no_soundtrack is not None:
+                self._mtmd_helper_init_opt.video_params.no_soundtrack = video_no_soundtrack
             if video_fps_target is not None:
                 self._mtmd_helper_init_opt.video_params.fps_target = video_fps_target
             if video_ffmpeg_bin_dir is not None:
@@ -215,6 +221,8 @@ class MTMDBaseHandler:
         self.is_support_vision = False
         self.is_support_audio = False
         self.is_support_video = False
+        # Shared capability snapshot, populated when the projector is initialized.
+        self.capabilities: Optional[mtmd_cpp.mtmd_helper_cap] = None
 
         self._exit_stack = ExitStack()
         self._mtmd_lock = threading.RLock()
@@ -270,9 +278,10 @@ class MTMDBaseHandler:
             raise ValueError(f"{self.log_prefix}(_init_mtmd_context): Failed to load mtmd context from: {self.mmproj_path}")
         self._bound_model = llama_model
         self.media_marker = self._mtmd_cpp.mtmd_get_marker(self.mtmd_ctx).decode("utf-8")
+        self.capabilities = self._query_capabilities(llama_model)
 
         # Check if vision is supported
-        self.is_support_vision = self._mtmd_cpp.mtmd_support_vision(self.mtmd_ctx)
+        self.is_support_vision = self.capabilities.vision
         if self.is_support_vision:
             if self.verbose:
                 print(f"{self.log_prefix}(_init_mtmd_context): Vision support detected.", file=sys.stderr)
@@ -281,7 +290,7 @@ class MTMDBaseHandler:
                 print(f"{self.log_prefix}(_init_mtmd_context): Vision is NOT supported by this mmproj model backend.", file=sys.stderr)
 
         # Check if audio is supported
-        self.is_support_audio = self._mtmd_cpp.mtmd_support_audio(self.mtmd_ctx)
+        self.is_support_audio = self.capabilities.audio
         if self.is_support_audio:
             if self.verbose:
                 print(f"{self.log_prefix}(_init_mtmd_context): Audio support detected.", file=sys.stderr)
@@ -290,13 +299,46 @@ class MTMDBaseHandler:
                 print(f"{self.log_prefix}(_init_mtmd_context): Audio is NOT supported by this mmproj model backend.", file=sys.stderr)
 
         # Check if video is supported
-        self.is_support_video = self._mtmd_cpp.mtmd_helper_support_video(self.mtmd_ctx)
+        self.is_support_video = self.capabilities.video
         if self.is_support_video:
             if self.verbose:
                 print(f"{self.log_prefix}(_init_mtmd_context): Video support detected.", file=sys.stderr)
         else:
             if self.verbose:
                 print(f"{self.log_prefix}(_init_mtmd_context): Video support is NOT available in this build.", file=sys.stderr)
+
+    def _query_capabilities(self, llama_model: llama_core.Llama):
+        mtmd = self._mtmd_cpp
+        query = getattr(mtmd, "mtmd_helper_get_capabilities", None)
+        if query is not None and not getattr(query, "__ctypes_optional__", False):
+            return query(llama_model.model, self.mtmd_ctx)
+
+        # Older DLLs expose separate queries; match the unified helper's semantics.
+        audio_type = mtmd.mtmd_gen_audio_get_info(self.mtmd_ctx).type
+        types = mtmd.mtmd_gen_audio_type
+        audio_gen = audio_type != types.MTMD_GEN_AUDIO_TYPE_NONE
+        text_gen = not audio_gen or llama_cpp_lib.llama_model_chat_template(llama_model.model, None) is not None
+        chat = text_gen and mtmd.mtmd_helper_model_can_chat(llama_model._ctx.ctx, self.mtmd_ctx)
+        delay_query = llama_cpp_lib.llama_model_n_tokens_delay
+        if chat and not getattr(delay_query, "__ctypes_optional__", False):
+            chat = delay_query(llama_model.model) == 0
+        stream_query = getattr(mtmd, "mtmd_support_audio_stream", None)
+        audio_stream = (
+            bool(stream_query(self.mtmd_ctx))
+            if stream_query is not None and not getattr(stream_query, "__ctypes_optional__", False)
+            else False
+        )
+        return mtmd.mtmd_helper_cap(
+            chat=chat,
+            vision=mtmd.mtmd_support_vision(self.mtmd_ctx),
+            audio=mtmd.mtmd_support_audio(self.mtmd_ctx),
+            video=mtmd.mtmd_helper_support_video(self.mtmd_ctx),
+            audio_stream=audio_stream, text_gen=text_gen,
+            audio_gen=audio_gen,
+            audio_gen_spk_ref=audio_type in (
+                types.MTMD_GEN_AUDIO_TYPE_QWEN3TTS, types.MTMD_GEN_AUDIO_TYPE_POCKETTTS,
+            ),
+        )
 
     def close(self) -> None:
         """Explicitly free the shared mtmd resources."""
@@ -311,6 +353,7 @@ class MTMDBaseHandler:
         self._closed = True
         self._bound_model = None
         self.mctx_params = None
+        self.capabilities = None
         try:
             # Dependent resources must be freed before the mtmd context.
             if cleanup is not None:
@@ -879,8 +922,8 @@ class MTMDEmbeddingHandler(MTMDBaseHandler):
             if not (self.is_support_vision or self.is_support_audio):
                 raise ValueError("MTMD projector does not support image or audio embeddings")
             with self.tokenize(model, prompt, media, parts=parts) as request:
-                limit = min(model.n_ctx(), model._ctx.n_batch(), model._ctx.n_ubatch())
-                if not 0 < request.n_tokens <= limit or request.n_pos > model.n_ctx():
+                limit = min(model.n_ctx_seq(), model._ctx.n_batch(), model._ctx.n_ubatch())
+                if not 0 < request.n_tokens <= limit or request.n_pos > model.n_ctx_seq():
                     raise ValueError(f"Full multimodal input ({request.n_tokens} tokens) must fit one microbatch ({limit})")
                 model.reset()
                 try:
@@ -998,7 +1041,7 @@ class MTMDAudioGenerator(MTMDBaseHandler):
             params=LlamaSamplingParams(
                 seed=seed, temp=temperature, top_k=top_k, top_p=top_p,
                 min_p=min_p, penalty_repeat=repeat_penalty,
-                penalty_last_n=llama.n_ctx(),
+                penalty_last_n=llama.n_ctx_seq(),
             ),
             model=llama._model,
         )
@@ -1104,6 +1147,7 @@ class MTMDAudioGenerator(MTMDBaseHandler):
         text: str,
         language: Optional[str] = None,
         speaker_reference: Optional[Union[str, os.PathLike[str], bytes]] = None,
+        voice: Optional[str] = None,
         response_format: Literal["wav", "pcm_f32"] = "wav",
         max_frames: int = 512,
         seed: Optional[int] = None,
@@ -1117,10 +1161,15 @@ class MTMDAudioGenerator(MTMDBaseHandler):
 
         Qwen3-TTS uses the sampling options; top_k/top_p also reach its code
         predictor (top_k <= 0 selects the helper default for that stage).
-        Pocket TTS requires speaker_reference, ignores sampling options except
+        Pocket TTS requires speaker_reference or a predefined voice, ignores sampling options except
         seed, and selects language and flow settings from its weights.
         Soprano uses token sampling and a fixed English voice; omit language
         and speaker_reference, and allow at least two generated frames.
+        Chatterbox uses token sampling and a reference or predefined voice.
+        Its multilingual variant requires a CFG-enabled backbone,
+        n_seq_max >= 2 and kv_unified=True; sequence capacity is not changed.
+        Drama 3 samples inside the helper; only seed affects sampling. Put
+        speaker tags in text and omit language, voice and speaker_reference.
         References accept encoded audio bytes, local paths, URLs or data URIs.
         max_frames limits helper generation steps, not text tokens or seconds.
         Llama.abort() interrupts synthesis with InterruptedError.
@@ -1136,6 +1185,10 @@ class MTMDAudioGenerator(MTMDBaseHandler):
                 not isinstance(language, str) or not language.strip() or "\x00" in language
             ):
                 raise ValueError("language must be a non-empty string without NUL characters")
+            if voice is not None and (not isinstance(voice, str) or not voice.strip() or "\x00" in voice):
+                raise ValueError("voice must be a non-empty string without NUL characters")
+            if voice is not None and speaker_reference is not None:
+                raise ValueError("voice and speaker_reference are mutually exclusive")
             if response_format not in ("wav", "pcm_f32"):
                 raise ValueError("response_format must be 'wav' or 'pcm_f32'")
             if isinstance(max_frames, bool) or not isinstance(max_frames, int) or max_frames <= 0:
@@ -1163,10 +1216,48 @@ class MTMDAudioGenerator(MTMDBaseHandler):
             is_qwen = info.type == types.MTMD_GEN_AUDIO_TYPE_QWEN3TTS
             is_pocket = info.type == types.MTMD_GEN_AUDIO_TYPE_POCKETTTS
             is_soprano = info.type == types.MTMD_GEN_AUDIO_TYPE_SOPRANO
-            if not (is_qwen or is_pocket or is_soprano):
+            is_chatterbox = info.type == types.MTMD_GEN_AUDIO_TYPE_CHATTERBOX
+            is_drama = info.type == types.MTMD_GEN_AUDIO_TYPE_DRAMA3
+            if info.type not in (
+                types.MTMD_GEN_AUDIO_TYPE_QWEN3TTS,
+                types.MTMD_GEN_AUDIO_TYPE_POCKETTTS,
+                types.MTMD_GEN_AUDIO_TYPE_SOPRANO,
+                types.MTMD_GEN_AUDIO_TYPE_CHATTERBOX,
+                types.MTMD_GEN_AUDIO_TYPE_DRAMA3,
+            ):
                 raise ValueError("mmproj does not provide a supported TTS pipeline")
-            if is_pocket and speaker_reference is None:
-                raise ValueError("Pocket TTS requires speaker_reference")
+            if is_drama:
+                if speaker_reference is not None:
+                    raise ValueError("Drama 3 does not support speaker_reference")
+                if language is not None:
+                    raise ValueError("Drama 3 determines language from text; omit language")
+                if voice is not None:
+                    raise ValueError("Drama 3 uses speaker tags in text; omit voice")
+            if voice is not None and not (is_pocket or is_chatterbox):
+                raise ValueError("voice is supported only for Pocket TTS and Chatterbox")
+            if (is_pocket or is_chatterbox) and voice is None and speaker_reference is None and info.n_voices > 0:
+                name = mtmd.mtmd_gen_audio_voice_name(self.mtmd_ctx, 0)
+                if not name:
+                    raise RuntimeError("TTS reports predefined voices but returned no default voice")
+                voice = name.decode("utf-8")
+            if is_pocket and speaker_reference is None and voice is None:
+                raise ValueError("Pocket TTS requires speaker_reference or voice")
+            if is_chatterbox:
+                if voice is None and speaker_reference is None:
+                    raise ValueError("Chatterbox requires speaker_reference or a predefined voice")
+                # The multilingual helper pairs conditioned/unconditioned CFG sequences.
+                multilingual = mtmd.mtmd_gen_audio_read_tensor(self.mtmd_ctx, b"a.gen.t3.text_pos_emb", None, 0) > 0
+                if multilingual:
+                    if not llama._model.classifier_free_guidance():
+                        raise ValueError(
+                            "Chatterbox multilingual requires a backbone GGUF with "
+                            "<architecture>.classifier_free_guidance=true. Reconvert the "
+                            "backbone with the current vendor Chatterbox converter and "
+                            "use matching multilingual projector weights."
+                        )
+                    # Capacity is already physical: seq_id=0 pairs with n_seq_max // 2.
+                    if llama._ctx.n_seq_max() < 2 or not llama.context_params.kv_unified:
+                        raise ValueError("Chatterbox multilingual requires Llama(n_seq_max=2, kv_unified=True)")
             if is_pocket and language is not None:
                 raise ValueError("Pocket TTS language is determined by its weights")
             if is_soprano:
@@ -1179,8 +1270,20 @@ class MTMDAudioGenerator(MTMDBaseHandler):
 
             with ExitStack() as cleanup:
                 speaker = None
+                if voice is not None:
+                    speaker = mtmd.mtmd_gen_audio_get_voice(self.mtmd_ctx, voice.encode("utf-8"))
+                    if not speaker:
+                        raise ValueError(f"Unknown predefined voice: {voice}")
+                    cleanup.callback(mtmd.mtmd_bitmap_free, speaker)
                 if speaker_reference is not None:
-                    if not self.is_support_audio:
+                    # Voice-reference support is distinct from general audio input.
+                    supports_reference = (
+                        self.capabilities.audio_gen_spk_ref
+                        if self.capabilities is not None else self.is_support_audio
+                    )
+                    # The vendor capability helper currently omits Chatterbox.
+                    supports_reference = supports_reference or is_chatterbox
+                    if not supports_reference:
                         raise ValueError("mmproj does not support reference audio input")
                     payload = speaker_reference if isinstance(speaker_reference, bytes) else self.load_media(os.fspath(speaker_reference), "audio")
                     self.detect_audio_format(payload)
@@ -1198,7 +1301,7 @@ class MTMDAudioGenerator(MTMDBaseHandler):
 
                 actual_seed = llama_cpp_lib.LLAMA_DEFAULT_SEED if seed is None else seed
                 sampler = None
-                if is_qwen or is_soprano:
+                if is_qwen or is_soprano or is_chatterbox:
                     sampler = self._create_audio_sampler(
                         llama, seed=actual_seed, temperature=temperature, top_k=top_k,
                         top_p=top_p, min_p=min_p, repeat_penalty=repeat_penalty,
@@ -1293,6 +1396,7 @@ class MTMDChatHandler(MTMDBaseHandler):
         video_fps_target: Optional[float] = None,
         video_ffmpeg_bin_dir: Optional[Union[str, os.PathLike[str]]] = None,
         video_timestamp_interval_ms: Optional[int] = None,
+        video_no_soundtrack: Optional[bool] = None,
         **kwargs
     ):
 
@@ -1307,6 +1411,7 @@ class MTMDChatHandler(MTMDBaseHandler):
             video_fps_target=video_fps_target,
             video_ffmpeg_bin_dir=video_ffmpeg_bin_dir,
             video_timestamp_interval_ms=video_timestamp_interval_ms,
+            video_no_soundtrack=video_no_soundtrack,
             **kwargs,
         )
 
@@ -1985,6 +2090,7 @@ class MTMDChatHandler(MTMDBaseHandler):
                 os.path.realpath(self.mmproj_path), projector_stat.st_size, projector_stat.st_mtime_ns,
                 self.image_min_tokens, self.image_max_tokens,
                 float(video_params.fps_target), int(video_params.timestamp_interval_ms),
+                bool(video_params.no_soundtrack),
             )
 
             for i in range(n_chunks):
@@ -2124,8 +2230,8 @@ class MTMDChatHandler(MTMDBaseHandler):
                 # Public prompt checkpoints contain only target state. MTP also
                 # needs its draft context and pending NextN row reconstructed.
                 llama.reset()
-                if len(full_prompt_ids) > llama.n_ctx():
-                    raise ValueError("MTMD speculative prompt exceeds n_ctx; increase n_ctx")
+                if len(full_prompt_ids) > llama.n_ctx_seq():
+                    raise ValueError("MTMD speculative prompt exceeds n_ctx_seq; increase n_ctx")
             llama._last_eval_output_start = 0
             llama._last_eval_output_count = 0
             llama._prefilled_prompt = None
@@ -2231,26 +2337,26 @@ class MTMDChatHandler(MTMDBaseHandler):
                         print(f"{self.log_prefix}(__call__): Evaluating {media_str} chunk ({chunk_n_tokens} tokens) at pos {llama.n_tokens}...", file=sys.stderr)
 
                     # Conservatively check capacity using embedding rows, not M-RoPE positions.
-                    if n_past + chunk_n_tokens > llama.n_ctx():
+                    if n_past + chunk_n_tokens > llama.n_ctx_seq():
                         if media_callback is not None:
-                            raise ValueError("MTMD speculative media exceeds n_ctx; increase n_ctx")
+                            raise ValueError("MTMD speculative media exceeds n_ctx_seq; increase n_ctx")
                         if not llama._ctx.memory_can_shift():
                             raise RuntimeError(
                                 f"{self.log_prefix}(__call__): Context Shift is explicitly disabled by the C++ backend "
                                 f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
-                                f"Multimodal chunk exceeded context limit(currently n_ctx={llama._n_ctx}), "
+                                f"Multimodal chunk exceeded context limit(currently n_ctx_seq={llama._n_ctx}), "
                                 f"You MUST increase n_ctx to fit the dialogue."
                             )
                         else:
                             # Discard old positions while retaining the n_keep prefix.
-                            n_discard = (n_past + chunk_n_tokens) - llama.n_ctx() + llama.n_batch
+                            n_discard = (n_past + chunk_n_tokens) - llama.n_ctx_seq() + llama.n_batch
                             n_keep = min(llama.n_keep, n_past)
                             n_discard = min(n_discard, n_past - n_keep)
 
                             if n_discard <= 0:
                                 raise RuntimeError(f"{self.log_prefix}(__call__): Critical Overflow. Not enough unpinned tokens to discard for Context Shift.")
 
-                            if n_past - n_discard + chunk_n_tokens > llama.n_ctx():
+                            if n_past - n_discard + chunk_n_tokens > llama.n_ctx_seq():
                                 raise RuntimeError(f"{self.log_prefix}(__call__): Media chunk cannot fit alongside the retained context.")
 
                             if self.verbose:
@@ -2309,7 +2415,7 @@ class MTMDChatHandler(MTMDBaseHandler):
                             f"{self.log_prefix}(media prefill): "
                             f"Media evaluation failed with error code {result} "
                             f"(start_pos={n_past}, media_tokens={chunk_n_tokens}, "
-                            f"n_ctx={llama.n_ctx()}, n_batch={llama.n_batch})."
+                            f"n_ctx_seq={llama.n_ctx_seq()}, n_batch={llama.n_batch})."
                         )
                         if self._has_video_input(messages):
                             message += (
@@ -2325,7 +2431,7 @@ class MTMDChatHandler(MTMDBaseHandler):
 
                     # Native evaluation must advance by n_pos, even when n_tokens differs.
                     expected_pos = n_past + chunk_n_pos
-                    if new_n_past.value != expected_pos or not n_past <= new_n_past.value <= llama.n_ctx():
+                    if new_n_past.value != expected_pos or not n_past <= new_n_past.value <= llama.n_ctx_seq():
                         raise ValueError(
                             f"{self.log_prefix}(media prefill): Invalid output position {new_n_past.value}; "
                             f"expected {expected_pos} (start_pos={n_past}, media_positions={chunk_n_pos})."
@@ -2527,6 +2633,7 @@ class GenericMTMDChatHandler(MTMDChatHandler):
         **kwargs
     ) -> None:
         self._qwen_vision_template = False
+        self._normalize_vision_wrappers = False
         # One native prefix snapshot, separate from the negative media ID mappings.
         self._media_checkpoint_cache = None
         # Stick to host storage after a failed device export on the current context.
@@ -2641,11 +2748,14 @@ class GenericMTMDChatHandler(MTMDChatHandler):
 
         architecture = getattr(llama, "metadata", {}).get("general.architecture", "")
         self._qwen_vision_template = architecture.startswith("qwen") and "<|vision_start|>" in self.chat_format
+        self._normalize_vision_wrappers = (
+            self._qwen_vision_template or architecture == "lfm3"
+        ) and "<|vision_start|>" in self.chat_format
 
     def _replace_media_placeholders(self, text, media_items):
         text = super()._replace_media_placeholders(text, media_items)
-        if self._qwen_vision_template:
-            # Qwen's stored template wraps placeholders; MTMD wraps each expanded frame.
+        if self._normalize_vision_wrappers:
+            # MTMD owns Qwen/LFM3 image boundaries and LFM3's outer video boundary.
             pattern = r"<\|vision_start\|>\s*" + re.escape(self.media_marker) + r"\s*<\|vision_end\|>"
             text = re.sub(pattern, lambda _: self.media_marker, text)
         return text

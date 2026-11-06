@@ -695,6 +695,20 @@ for the available hardware. Use `verbose=False` for
 quiet error-only native logging, or set `verbosity` from `0` to `5` for finer
 control; `verbosity` takes precedence when both are provided.
 
+`llm.n_ctx()` reports total native context capacity; `llm.n_ctx_seq()` reports
+the usable single-sequence window used by generation and multimodal checks.
+With `kv_unified=False`, total capacity is partitioned among `n_seq_max` slots.
+For example, `n_ctx=512, n_seq_max=2` gives each sequence 256 tokens.
+With `kv_unified=True`, sequences share the total capacity. Native alignment can
+adjust requested sizes; query these methods for the actual limits. See the
+[context API](docs/wiki/core/Llama.md#n_ctx-and-n_ctx_seq).
+
+`n_seq_max` sets the capacity for independent sequence states. Ordinary
+completion and chat use sequence 0, including all turns in one conversation;
+keep the default `n_seq_max=1` unless a workflow requires additional sequences.
+Increasing it with non-unified KV can reduce the window available to that
+conversation. It does not enable concurrent chat requests on one `Llama` instance.
+
 ### Loading a Local GGUF
 
 Pass `model_path` when the model is already available locally:
@@ -1182,7 +1196,7 @@ Keep the image, prompt, output budget and hardware settings identical when
 comparing modes.
 
 Each MTP image request rebuilds target and draft state together. The complete
-prompt must fit `n_ctx`, and media must fit without context shifting. Increase
+prompt must fit `llm.n_ctx_seq()`, and media must fit without context shifting. Increase
 `--n-ctx` or reduce `--image-max-tokens` if needed. See the
 [Qwen3.5 image-chat guide](docs/wiki/examples/vision/vision-qwen.md#mtp-image-chat)
 for PowerShell commands and recovery behavior.
@@ -1662,9 +1676,10 @@ Video preprocessing options are passed through `chat_handler_kwargs`:
 
 | Option | MTMD default | Description |
 |:--- |:--- |:--- |
-| `video_fps_target` | `4.0` | Desired sampled FPS. Values `<= 0` use the video's native FPS and can be very expensive. |
+| `video_fps_target` | `4.0` | Sampled FPS when the model provides no recommendation. Values `<= 0` use native FPS in that case. |
 | `video_ffmpeg_bin_dir` | `None` | Directory containing both `ffmpeg` and `ffprobe`. `None` searches `PATH`. |
-| `video_timestamp_interval_ms` | `5000` | Interval between timestamp text chunks. Values `<= 0` disable timestamps. |
+| `video_timestamp_interval_ms` | `5000` | Timestamp interval for the default video layout; values `<= 0` disable these timestamps. LFM3 uses a timestamp before each frame pair. |
+| `video_no_soundtrack` | `False` | Skip the audio track for models that support video audio, such as LFM3-Omni. |
 | `batch_max_tokens` | `1024` | Maximum number of MTMD media tokens processed in one decode batch. |
 
 Advanced callers can instead pass a complete `mtmd_helper_init_opt` ctypes
@@ -1676,16 +1691,17 @@ Gemma 4's default template expects `{"type": "video", "video": ...}`; using
 `video_url` with that template produces no media marker and fails marker-count
 validation.
 
-The helper samples visual frames only. A video's audio track is ignored, so a
-vision-only model does not need audio-input support. Video understanding is
-therefore based on sampled frames, timestamps, and model-specific temporal frame
-merging rather than native audio/video stream modeling.
+The native helper selects the model's video layout and preprocessing. LFM3-VL
+and LFM3-Omni use model-recommended frame sampling and sizing, overriding generic
+FPS settings. LFM3-Omni also includes soundtrack segments after frame groups;
+set `video_no_soundtrack=True` for visual-only input. Other vision-only models
+continue to use sampled frames without the audio track.
 
 > **Resource note:** The current helper reads the input video into memory and
 > expands all sampled frames during MTMD tokenization. There is no automatic
-> duration, frame-count, or total-video-token budget. Begin with short videos
-> and a low FPS; long or high-resolution videos can consume substantial RAM and
-> exceed the model context window.
+> total-video-token budget. Model-specific frame limits may apply. Begin with short
+> videos and a low FPS where configurable; long or high-resolution videos can
+> consume substantial RAM and exceed the model context window.
 
 For a configurable command-line version, including `-h` setup guidance, see
 [`examples/high_level_api/mtmd_video_chat.py`](examples/high_level_api/mtmd_video_chat.py).
@@ -1962,8 +1978,10 @@ or server `chat_format`.
 | Model | Python API | Reference audio | Language |
 |:--- |:--- |:--- |:--- |
 | [Qwen3-TTS-12Hz-Base-GGUF](https://huggingface.co/JamePeng2023/Qwen3-TTS-12Hz-Base-GGUF) | `MTMDAudioGenerator` | Optional speaker reference | Selectable, including Chinese, English and Japanese |
-| Pocket TTS | `MTMDAudioGenerator` | Required | Determined by the language-pack weights |
+| Pocket TTS | `MTMDAudioGenerator` | Reference audio or predefined voice | Determined by the language-pack weights |
 | Soprano-80M / Soprano-1.1-80M | `MTMDAudioGenerator` | Unsupported; fixed voice | English; omit `language` |
+| Chatterbox Turbo / Multilingual V3 | `MTMDAudioGenerator` | Reference audio or predefined voice (first voice used by default) | Turbo: English; Multilingual V3: selectable |
+| Drama 3 | `MTMDAudioGenerator` | Unsupported; speaker tags in text | Determined by text; omit `language` |
 
 The Qwen repository currently provides **1.7B Base** backbone and mmproj files
 in BF16, F16 and Q8_0. The example below uses the tested BF16 pair. Download both
@@ -2000,9 +2018,26 @@ with closing(Llama(
 Use `speaker_reference="/path/to/reference.wav"` for a reference voice, or omit
 it for Qwen without a reference;
 encoded audio bytes, URLs and data URIs are also accepted. For Pocket, provide
-a reference and omit `language`. Qwen currently uses only the reference speaker
+a reference or `voice="alba"` (when included in the weights), and omit `language`.
+Use the low-level `mtmd_gen_audio_voice_name` API to enumerate available voices.
+Qwen currently uses only the reference speaker
 embedding: `ref_text`-conditioned full cloning, CustomVoice and preset speaker
 IDs are not supported. The FA option controls mmproj independently of the backbone.
+
+For Chatterbox, supply a reference or use a voice included in the weights.
+Omitting both selects the first predefined voice. Multilingual V3 requires
+`Llama(n_seq_max=2, kv_unified=True)` for CFG and accepts `language="fr"`, for example.
+The backbone GGUF must declare `<architecture>.classifier_free_guidance=true`;
+reconvert older backbones with the current vendor converter if this flag is
+missing. Python validates the metadata and paired capacity without changing
+`n_seq_max`: the value `2` already includes both CFG branches. Turbo does not
+require this flag or paired sequences.
+See the [vendor conversion guide](vendor/llama.cpp/tools/tts/README.md#chatterbox).
+
+Drama 3 uses helper-managed sampling and 44.1 kHz audio. Put `<|speaker:0|>`
+through `<|speaker:15|>` in the text for different speakers; omit `language`,
+`voice` and `speaker_reference`. Only `seed` affects its sampling; generation
+is also bounded by the native codebook tower's 4096-position limit.
 
 For Soprano, use matching backbone and mmproj files, supply English text, and
 omit both `speaker_reference` and `language`. See the
@@ -2274,6 +2309,11 @@ print(f"Generated {len(embeddings)} vectors.")
 > the desired number of short documents per batch. The batcher flushes when
 > token or sequence capacity is reached; `n_seq_max=1` processes inputs
 > sequentially. Larger values can use more context resources.
+> `LlamaEmbedding` enables unified KV, so inputs in a batch share `llm.n_ctx()`.
+> Increasing `n_seq_max` permits more inputs per batch without multiplying
+> that token capacity; token and microbatch limits still apply.
+> Each input must also fit `llm.n_ctx_seq()` and the effective batch limit;
+> `truncate=False` raises `ValueError` for oversized inputs before decoding them.
 > `LLAMA_POOLING_TYPE_NONE` returns one vector per token, adding a token
 > dimension to each input's output; it does not return one pooled document vector.
 
@@ -2408,7 +2448,7 @@ with closing(LlamaEmbedding(
 ```
 
 Media is supplied as encoded file bytes; `parts` manages native markers.
-The full input, including media tokens, must fit `n_ctx`, `n_batch`, and
+The full input, including media tokens, must fit `llm.n_ctx_seq()`, `n_batch`, and
 `n_ubatch`. This API does not truncate or split oversized requests, and rejects
 video and NONE/RANK pooling. Each call resets generation state once execution
 starts. `create_embedding()` remains a text API.

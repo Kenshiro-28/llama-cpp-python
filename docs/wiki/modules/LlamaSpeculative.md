@@ -2,7 +2,7 @@
 title: Llama Speculative Decoding
 module_name: llama_cpp.llama_speculative
 source_file: llama_cpp/llama_speculative.py
-last_updated: 2026-10-18
+last_updated: 2026-11-06
 version_target: "latest"
 ---
 
@@ -128,7 +128,7 @@ additional Python-engine settings.
 | `draft_p_split` | `0.1` | Reserved split probability matching `llama.cpp`. |
 | `draft_p_min` | `0.0` | MTP/DFlash token-probability threshold, DFlash2 selector-transition threshold, or DSpark predicted acceptance-confidence threshold. |
 | `draft_model_path` | `None` | External draft GGUF. Omit it for built-in target MTP heads. |
-| `draft_backend_sampling` | `True` | Let supported model-backed engines select compact candidates on the backend instead of copying full logits rows to Python. DFlash2 uses its selector lattice instead, so this request remains inactive for DFlash2. |
+| `draft_backend_sampling` | `True` | Use compact backend candidates instead of full vocabulary rows for MTP, DFlash v1, and DSpark where supported. DFlash2 and LiliCorr use their selector lattices and leave this request inactive. |
 
 ### External draft runtime settings
 
@@ -143,6 +143,16 @@ additional Python-engine settings.
 | `draft_tensor_buft_overrides` | `None` | Native tensor buffer-type overrides retained for the lifetime of the external draft model. |
 | `draft_type_k`, `draft_type_v` | `None` | Optional draft KV-cache data types. |
 | `draft_model_kwargs` | `{}` | Additional native draft model parameters. |
+
+The draft context inherits the target context's batch parameters; engines may
+increase capacity to fit their noise block. `SpecConfig` does not currently
+expose the upstream `--spec-draft-n-ubatch` override. `draft_model_kwargs`
+configures model loading, so it cannot override the draft context's `n_ubatch`.
+
+Draft proposals use greedy candidate selection. `draft_backend_sampling`
+controls where candidates are processed; it does not enable upstream
+probabilistic drafting or rejection sampling with a proposal distribution.
+Target verification still uses the application's configured sampling settings.
 
 ### N-gram settings
 
@@ -236,7 +246,7 @@ Its shared responsibilities are:
 | Context parameters | Copy target defaults while forcing `embeddings=False` and unspecified pooling, then apply draft threads and KV types. |
 | Candidate selection | Prefer backend top-k candidate buffers; fall back to selecting from the top ten entries of the full CPU logits row. |
 | Native buffers | Copy transient ctypes embedding rows into owned NumPy arrays before another graph execution invalidates their pointers. |
-| Lifecycle | Retain ctypes arrays, detach samplers, and close batches, draft context, and an engine-owned model in a shutdown-safe, idempotent order. |
+| Lifecycle | Retain ctypes arrays, detach sampling, then close batches, draft context, sampler, and an engine-owned model in a shutdown-safe, idempotent order. |
 
 To add another model-backed algorithm, subclass `_LlamaModelDraftEngine`, call
 `_init_model_draft_engine()` before allocating native resources, load and
@@ -245,6 +255,12 @@ context from `_build_draft_context_params()`, and enable backend sampling only
 after `draft_context` exists. The subclass must still implement the
 `LlamaSpecEngine` request hooks and call `_close_draft_resources()` from an
 idempotent `close()`.
+
+`clear()` synchronizes draft work before clearing KV and resetting the backend
+sampler. If sampler detachment fails during close, its owner remains alive
+through native context destruction, which synchronizes pending work. Cleanup
+attempts every remaining resource before reporting an error. Sampler setup and
+MTP initialization failures also release partially initialized resources.
 
 Ownership is intentionally asymmetric: the target model and context are always
 borrowed from `Llama`; every concrete engine owns its draft context and batches;
@@ -288,8 +304,8 @@ important for large vocabularies.
 
 1. **Initialize:** borrow the target model for built-in heads or load an
    external MTP sidecar, create an MTP context linked through `ctx_other`, and
-   enable target/draft NextN hidden outputs. `begin()` is currently the base
-   no-op because MTP state is initialized from decoded target rows.
+   enable target/draft NextN hidden outputs. `begin()` warns about incomplete
+   non-shared draft prompt coverage; shared-KV assistants use target memory.
 2. **Process:** after each synchronized target decode, `process()` copies the
    target NextN rows and advances the draft context. Shared-memory assistants
    such as `gemma4-assistant` skip the ordinary catch-up decode.
@@ -302,16 +318,25 @@ important for large vocabularies.
    `rollback_verified()` or `restore()` to discard the rejected suffix while
    retaining the sampled token and accepted prefix.
 5. **Reset or close:** `clear()` removes request-local memory and sampler state;
-   `close()` additionally releases the draft batch/context and an externally
-   owned sidecar model.
+   `close()` additionally releases the draft batch/context, sampler, and an
+   engine-owned external sidecar model.
+
+Shared-KV assistants enable masked target NextN output so Gemma4 can prune
+unselected prompt rows before its shared layers. Output-free prompt batches
+leave the pending hidden row unchanged and clear temporary verification rows.
+Sparse prefill retains the selected final row using its original batch index;
+verification batches that select every token retain all rows for acceptance and
+rollback. Non-shared MTP contexts continue to request dense hidden output for
+catch-up on every target row.
 
 ### Lower-level embedding processing
 
 `process()` accepts a decoded legacy `llama_batch` containing token IDs or
 external input embeddings. Embedding rows use the target's `n_embd_inp()`;
-the separate NextN states use `n_embd_out()`. The first row carries the pending
-state from the preceding batch, and subsequent rows carry the preceding target
-row's state. This handoff continues across text and embedding batches.
+the separate NextN states use `n_embd_out()`. For non-shared contexts, the first
+row carries the pending state from the preceding batch, and subsequent rows
+carry the preceding target row's state. This handoff continues across text and
+embedding batches.
 
 Scalar positions are retained. For M-RoPE and IM-RoPE, all four position planes
 are converted from native section-major storage to entry-major coordinates for
@@ -321,8 +346,8 @@ Empty batches and batches with both or neither legacy input pointers are ignored
 
 The embedding catch-up builder is created on first use and reused. Input
 features and hidden states are submitted separately through `add_embeddings(...,
-states=...)`. Dense NextN rows are fetched once per target batch, and verification
-records own the media features and coordinates needed for checkpoint replay.
+states=...)`. Non-shared contexts fetch dense NextN rows once per target batch.
+Verification records own the media features and coordinates needed for replay.
 If accepted and rejected image rows share a cache position, rollback restores
 the checkpoint and replays the retained prefix instead of truncating by position.
 Temporary builder rows are released after catch-up; `clear()` and `close()`
@@ -439,9 +464,10 @@ scores and drafting stops before a transition below the threshold.
    enable selected target input taps, and configure the resolved variant's
    output mode.
 2. **Process prompt and begin:** each synchronized target decode calls
-   `process()`, which gathers the configured target-layer rows and passes them
-   to the fused encoder/KV-injection draft decode. After prompt evaluation,
-   `begin()` verifies that this processing populated the complete draft prompt;
+   `process()`, which passes the configured target-layer rows through device
+   references or host copies to the fused encoder/KV-injection draft decode.
+   After prompt evaluation, `begin()` verifies that this processing populated
+   the complete draft prompt;
    later target decodes continue through the same `process()` path.
 3. **Draft:** `draft()` captures a native or partial on-device checkpoint,
    decodes one anchor-plus-mask block, applies DFlash token probability,
@@ -454,7 +480,7 @@ scores and drafting stops before a transition below the threshold.
    token plus accepted target features.
 5. **Reset or close:** `clear()` empties request-local cache and sampler state;
    `close()` releases both batches, the draft context, sampler, and
-   external sidecar model.
+   external sidecar model, then disables device feature capture on the target.
 
 All variants currently require an external draft GGUF:
 
@@ -537,9 +563,43 @@ configuration instead of inferring it from the target architecture.
 Target layer IDs come from the sidecar GGUF. Values from `0` through
 `target_model.n_layer()` are valid: the inclusive final value denotes the final
 head-input tap required by architectures such as Nemotron DFlash. Target rows
-are copied into draft-`n_ubatch` chunks. The draft graph fuses its encoder with
-KV injection in one decode, avoiding the previous device-to-host-to-device
-round trip and the separate encoder graph build.
+are submitted in draft-`n_ubatch` chunks, preserving their original target batch
+indices across chunks. The draft graph fuses encoding and KV injection in one
+decode; the feature transfer path determines whether host copies are needed.
+
+### Device feature transfer
+
+The current source can keep captured target-layer features in a native device
+buffer and submit row references to the draft context. This avoids downloading,
+concatenating, and uploading the target features in Python. Applications using
+`Llama(speculative=...)` do not need to construct those references themselves.
+
+The engine selects this path during construction when all of the following hold:
+
+- The loaded native library provides `llama_set_embeddings_layer_inp_dev`,
+  `llama_supports_embd_row`, and `llama_batch_ext_add_embd_row`.
+- Target layer IDs are strictly increasing, matching the buffer's layer order.
+- The draft backend can read the target feature buffer. Device placement alone
+  does not guarantee this; unsupported placements fall back to host copies.
+- The draft uses native suffix rollback without accepted-feature replay.
+- The sidecar is DFlash, DFlash2, or DSpark. LiliCorr retains its host projection
+  path because it needs projected anchor features.
+
+`LLAMA_DFLASH_DEV` defaults to `1`. Set it to `0` before constructing `Llama`
+to force host copies; set it to `1` or leave it unset to allow device transfer.
+Changing the environment after construction does not switch an existing engine.
+With `verbose=True`, startup output includes `target_features=device` or
+`target_features=host`.
+
+Missing optional symbols, an unreadable device buffer, unordered taps, or a
+draft rollback path requiring replay select host copies. Host mode still uses
+the configured model devices and fused draft graph. Feature transfer is separate
+from whether checkpoints store recurrent tensors on the device.
+
+Device rows borrow the target's latest captured batch. They are consumed before
+another target decode replaces that buffer, and the draft is closed before the
+buffer is released. For manual submission and ownership rules, see
+[device feature rows](LlamaBatch.md#device-feature-rows).
 
 ## N-gram Map Engines
 
@@ -716,6 +776,14 @@ DSpark, and other vocabulary-sampling engines, keep backend sampling enabled
 unless profiling shows otherwise. DFlash2 always selects from its compact
 selector lattice and therefore reports backend sampling as inactive.
 
+Compare host and device feature transfer with the same prompt, draft length,
+sampling settings, and output token count. Warm each path before measuring and
+repeat or interleave measurements to reduce ordering effects. A lower
+`process_seconds` does not guarantee higher total throughput: draft computation,
+target verification, and acceptance also contribute. Raising DSpark's
+`draft_p_min` can improve the acceptance fraction while discarding useful draft
+work and slowing generation. See the [runnable comparison guide](../examples/speculative-decoding.md#compare-host-and-device-feature-transfer).
+
 ## Limitations and Lifecycle Notes
 
 ### Native draft positions and image batches
@@ -758,11 +826,16 @@ MTP's native `rollback_verified()` also validates the capture before mutating
 state. Native rollback failures invalidate it. This path keeps the accepted
 hidden row directly; accepted feature blocks are copied only when restoration
 and replay are necessary, including media rows that share a native position.
+MTP's transient checkpoint copies its boundary `pending_h` row and restores it
+with the draft context; verification rows are rebuilt on the replay path.
 
 These transient checkpoints are separate from `HybridCheckpointCache` prompt
 history and from `LlamaState`. A complete target snapshot does not include draft
 hidden states, pending features, or sampler progression. See
 [state restoration](../core/Llama.md#save_state-and-load_statestate).
+After `load_state()`, speculative generation requires a fresh request with
+`reset=True` and the complete text prompt; `reset=False` raises `RuntimeError`
+because the public snapshot did not restore draft state.
 
 ### Prefix-cache reuse and `reset`
 

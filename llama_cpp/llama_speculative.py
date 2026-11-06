@@ -2,6 +2,7 @@ import abc
 import collections
 import ctypes
 import enum
+import os
 import sys
 import time
 
@@ -1220,39 +1221,20 @@ class _LlamaModelDraftEngine(LlamaSpecEngine):
         if not self.config.draft_backend_sampling:
             return
         backend_sampler = internals.LlamaSampler()
+        # Register ownership before setup so constructor failure cleanup handles
+        # both partially built chains and a failed native attachment.
+        self._backend_sampler = backend_sampler
         backend_sampler.add_top_k(10)
         if self.draft_context.set_sampler(0, backend_sampler):
-            self._backend_sampler = backend_sampler
             self._backend_sampling = True
         else:
+            self._backend_sampler = None
             backend_sampler.close()
 
     def _reset_backend_sampler(self) -> None:
         """Reset request-local sampler state without detaching the sampler."""
         if self._backend_sampler is not None:
             self._backend_sampler.reset()
-
-    def _close_backend_sampler(self, errors: List[Exception]) -> None:
-        """Detach and close the sampler while preserving cleanup failures.
-
-        Cleanup remains non-short-circuiting: detach and close exceptions are
-        appended to ``errors`` so callers can release every remaining resource
-        and raise the first failure afterward.
-        """
-        backend_sampler = self._backend_sampler
-        self._backend_sampler = None
-        self._backend_sampling = False
-        if backend_sampler is None:
-            return
-        if getattr(self, "draft_context", None) is not None:
-            try:
-                self.draft_context.set_sampler(0, None)
-            except Exception as exc:
-                errors.append(exc)
-        try:
-            backend_sampler.close()
-        except Exception as exc:
-            errors.append(exc)
 
     def _close_draft_resources(
         self,
@@ -1261,7 +1243,7 @@ class _LlamaModelDraftEngine(LlamaSpecEngine):
         batch_names: Sequence[str],
         close_model: bool,
     ) -> None:
-        """Release draft resources in sampler, batch, context, model order.
+        """Detach sampling, then release batches, context, sampler, and model.
 
         ``batch_names`` lets each algorithm declare its owned batch attributes.
         ``close_model`` must be true only for an external engine-owned model.
@@ -1269,7 +1251,15 @@ class _LlamaModelDraftEngine(LlamaSpecEngine):
         cleanup idempotent. All exceptions are collected in ``errors`` rather
         than preventing later native resources from being released.
         """
-        self._close_backend_sampler(errors)
+        backend_sampler = self._backend_sampler
+        self._backend_sampler = None
+        self._backend_sampling = False
+        if backend_sampler is not None and getattr(self, "draft_context", None) is not None:
+            try:
+                if not self.draft_context.set_sampler(0, None):
+                    raise RuntimeError("Failed to detach draft backend sampler")
+            except Exception as exc:
+                errors.append(exc)
         for name in batch_names:
             batch = getattr(self, name, None)
             setattr(self, name, None)
@@ -1284,6 +1274,14 @@ class _LlamaModelDraftEngine(LlamaSpecEngine):
         if draft_context is not None:
             try:
                 draft_context.close()
+            except Exception as exc:
+                errors.append(exc)
+
+        # Even after a failed detach, keep the sampler alive through the native
+        # context's synchronization and destruction.
+        if backend_sampler is not None:
+            try:
+                backend_sampler.close()
             except Exception as exc:
                 errors.append(exc)
 
@@ -1434,8 +1432,10 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
         ) else 1
         if batch.n_embd != self.target_model.n_embd_inp() or batch.n_pos != expected_n_pos:
             raise ValueError("MTMD embedding width or position axes do not match the MTP target")
+        # MTMD's media helper requests no output rows; its borrowed view omits flags.
+        outputs = (ctypes.c_int8 * int(batch.n_tokens))()
         self.process(self._llama_cpp_lib.llama_batch(
-            n_tokens=batch.n_tokens, embd=batch.embd, pos=batch.pos,
+            n_tokens=batch.n_tokens, embd=batch.embd, pos=batch.pos, logits=outputs,
         ), seq_id=int(batch.seq_id))
 
     def __init__(
@@ -1521,29 +1521,28 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
             self.embedding_batch = None
 
             self._enable_backend_sampling(internals)
+            self.target_context.set_embeddings_nextn(True, masked=self.is_mem_shared)
+            self.draft_context.set_embeddings_nextn(True, masked=True)
+            self.pending_h = np.zeros(self.n_embd, dtype=np.float32)
+            self.verify_h = np.empty((0, self.n_embd), dtype=np.float32)
+            self.verify_tokens: List[int] = []
+            self.verify_positions: List[int] = []
+            self.verify_embeddings: Optional[npt.NDArray[np.float32]] = None
+            self.verify_media_positions: Optional[Sequence[Any]] = None
+            self._use_native_draft_rollback = (
+                not (self.draft_model.is_recurrent() or self.draft_model.is_hybrid())
+                or self.draft_context.n_rs_seq() >= config.draft_n_max
+            )
+            self._pending_verification_checkpoint = None
+            self.reset_checkpoint_stats()
+
+            if self.verbose:
+                self._print_runtime_configuration(context_params)
         except BaseException:
             self._close_draft_resources(
                 [], batch_names=("batch",), close_model=self._owns_model
             )
             raise
-
-        self.target_context.set_embeddings_nextn(True, masked=False)
-        self.draft_context.set_embeddings_nextn(True, masked=True)
-        self.pending_h = np.zeros(self.n_embd, dtype=np.float32)
-        self.verify_h = np.empty((0, self.n_embd), dtype=np.float32)
-        self.verify_tokens: List[int] = []
-        self.verify_positions: List[int] = []
-        self.verify_embeddings: Optional[npt.NDArray[np.float32]] = None
-        self.verify_media_positions: Optional[Sequence[Any]] = None
-        self._use_native_draft_rollback = (
-            not (self.draft_model.is_recurrent() or self.draft_model.is_hybrid())
-            or self.draft_context.n_rs_seq() >= config.draft_n_max
-        )
-        self._pending_verification_checkpoint = None
-        self.reset_checkpoint_stats()
-
-        if self.verbose:
-            self._print_runtime_configuration(context_params)
 
     def _candidate(self, output_index: int) -> Tuple[int, float]:
         return super()._candidate(output_index, suppress_tokens=self._suppressed_tokens)
@@ -1785,6 +1784,7 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
         if self._closed:
             return
         self._pending_verification_checkpoint = None
+        self.draft_context.synchronize()
         self.draft_context.memory_clear(True)
         self.pending_h.fill(0.0)
         self.verify_h = np.empty((0, self.n_embd), dtype=np.float32)
@@ -1815,10 +1815,12 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
             raise errors[0]
 
     def process(self, batch: Any, seq_id: int = 0) -> None:
-        """Consume target text or embedding rows and their dense NextN states.
+        """Consume target inputs and the NextN rows needed by the draft.
 
         Embedding batches use the target input width and section-major native
         positions. Input features and hidden states are copied before returning.
+        Shared-KV drafts retain only the final selected prefill row, or all
+        rows when the complete verification batch requests output.
         Call immediately after each successful target decode.
         """
         if seq_id != 0:
@@ -1837,11 +1839,25 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
             ):
                 raise NotImplementedError("MTP speculative decoding currently supports one sequence")
 
+        row_start = 0
+        if self.is_mem_shared:
+            if bool(batch.logits) and not batch.logits[n_tokens - 1]:
+                self.verify_h = np.empty((0, self.n_embd), dtype=np.float32)
+                self.verify_tokens.clear()
+                self.verify_positions.clear()
+                self.verify_embeddings = None
+                self.verify_media_positions = None
+                return
+            # Legacy batches without output flags select only their final row.
+            if not bool(batch.logits) or not all(batch.logits[i] for i in range(n_tokens)):
+                row_start = n_tokens - 1
+        n_rows = n_tokens - row_start
+
         embeddings = None
         media_positions = None
         if has_tokens:
-            positions = [int(batch.pos[i]) for i in range(n_tokens)]
-            tokens = [int(batch.token[i]) for i in range(n_tokens)]
+            positions = [int(batch.pos[i]) for i in range(row_start, n_tokens)]
+            tokens = [int(batch.token[i]) for i in range(row_start, n_tokens)]
         else:
             n_pos = 4 if self.target_model.rope_type() in (
                 self._llama_cpp_lib.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
@@ -1849,19 +1865,21 @@ class LlamaMTPDecoding(_LlamaModelDraftEngine):
             ) else 1
             pos_rows = np.ctypeslib.as_array(
                 batch.pos, shape=(n_tokens * n_pos,)
-            ).reshape(n_pos, n_tokens).T
+            ).reshape(n_pos, n_tokens).T[row_start:]
             positions = pos_rows[:, 0].tolist()
             media_positions = pos_rows.tolist() if n_pos > 1 else positions
             tokens = []
             embeddings = self._copy_rows(
                 batch.embd, n_tokens, self.target_model.n_embd_inp()
-            )
-        # MTP currently supports one sequence and target nextn embeddings are
-        # unmasked, so output rows are contiguous in physical batch order. Fetch
-        # the dense block once instead of crossing ctypes once per row. This also
-        # matches the catch-up input path in common/speculative.cpp.
+            )[row_start:]
+        # Only non-shared drafts need every row for catch-up. Sparse shared-KV
+        # output uses the original batch index, not a compact output index.
+        pointer = (
+            self.target_context.get_embeddings_nextn_ith(row_start)
+            if row_start else self.target_context.get_embeddings_nextn()
+        )
         target_h = self._copy_rows(
-            self.target_context.get_embeddings_nextn(), n_tokens, self.n_embd
+            pointer, n_rows, self.n_embd
         )
 
         self._process_target_rows(
@@ -2128,6 +2146,7 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             verbose=verbose,
         )
         self.is_dspark = config.spec_type == SpeculativeType.DRAFT_DSPARK
+        self._use_dev_features = False
         self._suppressed_tokens: Tuple[int, ...] = ()
         self.is_lilicorr = False
         self._lilicorr_features: Dict[int, npt.NDArray[np.float32]] = {}
@@ -2236,15 +2255,6 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
                     n_seq_max=1,
                     verbose=verbose,
                 )
-            self.inject_batch = internals.LlamaBatch(
-                n_tokens=self.draft_context.n_ubatch(),
-                embd=self.n_embd_enc,
-                n_seq_max=1,
-                verbose=verbose,
-            )
-            if self.is_mrope:
-                self.inject_batch.enable_mrope_positions()
-
             self._configure_draft_execution(internals)
 
             self._use_native_draft_rollback = (
@@ -2254,6 +2264,18 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
                 )
                 or self.draft_context.n_rs_seq() >= self.draft_limit
             )
+            self._configure_device_features()
+            if self._use_dev_features:
+                self.inject_batch = internals.LlamaBatchExt(context=self.draft_context)
+            else:
+                self.inject_batch = internals.LlamaBatch(
+                    n_tokens=self.draft_context.n_ubatch(),
+                    embd=self.n_embd_enc,
+                    n_seq_max=1,
+                    verbose=verbose,
+                )
+                if self.is_mrope:
+                    self.inject_batch.enable_mrope_positions()
             self._pending_verification_checkpoint = None
             self._active_verification_checkpoint = None
             self.verify_positions: List[int] = []
@@ -2291,6 +2313,31 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             True, masked=not self.is_dflash2 and not self.is_lilicorr
         )
         self.draft_context.set_causal_attn(self.causal_attn)
+
+    def _configure_device_features(self) -> None:
+        """Use device features when the decoder can roll back without replay."""
+        try:
+            enabled = int(os.environ.get("LLAMA_DFLASH_DEV", "1")) != 0
+        except ValueError:
+            enabled = False
+        # Replay needs host features after the target reuses its device buffer.
+        if (
+            not enabled or self.is_lilicorr or not self._use_native_draft_rollback
+            or any(a >= b for a, b in zip(self.target_layer_ids, self.target_layer_ids[1:]))
+        ):
+            return
+        symbols = (
+            self._llama_cpp_lib.llama_set_embeddings_layer_inp_dev,
+            self._llama_cpp_lib.llama_supports_embd_row,
+            self._llama_cpp_lib.llama_batch_ext_add_embd_row,
+        )
+        if any(getattr(func, "__ctypes_symbol_name__", None) is None for func in symbols):
+            return
+        self.target_context.set_embeddings_layer_inp_dev(True)
+        self._use_dev_features = True
+        if not self.draft_context.supports_embd_row():
+            self.target_context.set_embeddings_layer_inp_dev(False)
+            self._use_dev_features = False
 
     @staticmethod
     def _validate_target_layer_ids(
@@ -2364,7 +2411,8 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             f"lilicorr_top_k={self.lilicorr_top_k}, "
             f"mrope={self.is_mrope}, "
             f"target_layers={self.target_layer_ids}, "
-            f"feature_width={self.n_embd_enc}",
+            f"feature_width={self.n_embd_enc}, "
+            f"target_features={'device' if self._use_dev_features else 'host'}",
             file=sys.stderr,
         )
         print(
@@ -2444,6 +2492,18 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
         for offset in range(0, n_tokens, chunk_size):
             count = min(chunk_size, n_tokens - offset)
             positions = [int(batch.pos[offset + i]) for i in range(count)]
+            if getattr(self, "_use_dev_features", False):
+                self.inject_batch.reset()
+                for i, position in enumerate(positions):
+                    coordinates = (position, position, position, 0) if self.is_mrope else position
+                    self.inject_batch.add_embd_row(offset + i, coordinates, seq_ids=[seq_id])
+                status = self.draft_context.decode(self.inject_batch)
+                if status != 0:
+                    raise RuntimeError(
+                        f"DFlash device KV injection failed with status {status} "
+                        f"at feature row offset {offset}"
+                    )
+                continue
             features = self._gather_target_features(
                 batch_rows=n_tokens, offset=offset, count=count
             )
@@ -2451,7 +2511,10 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             self._inject_target_features(features, positions, seq_id=seq_id)
 
         self.verify_positions = [int(batch.pos[i]) for i in range(n_tokens)]
-        self.verify_features = np.concatenate(feature_chunks, axis=0)
+        self.verify_features = (
+            np.concatenate(feature_chunks, axis=0) if feature_chunks
+            else np.empty((0, self.n_embd_enc), dtype=np.float32)
+        )
 
     def _inject_target_features(
         self,
@@ -2882,6 +2945,7 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             (0, self.n_embd_enc), dtype=np.float32
         )
         if self.draft_context is not None:
+            self.draft_context.synchronize()
             self.draft_context.memory_clear(True)
         self._reset_backend_sampler()
 
@@ -2899,6 +2963,14 @@ class LlamaDFlashDecoding(_LlamaModelDraftEngine):
             batch_names=("noise_batch", "inject_batch"),
             close_model=True,
         )
+
+        # Close the draft before releasing features it may still be reading.
+        if getattr(self, "_use_dev_features", False):
+            try:
+                self.target_context.set_embeddings_layer_inp_dev(False)
+            except Exception as exc:
+                errors.append(exc)
+            self._use_dev_features = False
 
         if errors:
             raise errors[0]

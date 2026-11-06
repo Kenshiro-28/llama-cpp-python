@@ -5,6 +5,9 @@ import multiprocessing
 import threading
 import gc
 import weakref
+import ast
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from contextlib import closing, contextmanager
@@ -17,6 +20,239 @@ import llama_cpp._internals as internals
 from llama_cpp.llama_embedding import LlamaEmbedding, LLAMA_POOLING_TYPE_NONE
 
 MODEL = "./vendor/llama.cpp/models/ggml-vocab-llama-spm.gguf"
+
+
+@contextmanager
+def _native_batch(ctx):
+    batch = llama_cpp.llama_batch_ext_init(ctx)
+    assert batch
+    try:
+        yield batch
+    finally:
+        llama_cpp.llama_batch_ext_free(batch)
+
+
+def _last_logits(model, context=None):
+    context = model._ctx if context is None else context
+    return np.ctypeslib.as_array(context.get_logits_ith(-1), shape=(model.n_vocab(),))
+
+
+def _uses_mrope(model):
+    return model._model.rope_type() in (
+        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
+        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_IMROPE,
+    )
+
+
+def _required_model_path(variable):
+    path = os.environ.get(variable)
+    if not path:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(f"{variable} is required in Actions")
+        pytest.skip(f"Set {variable} to run real-model tests")
+    assert os.path.isfile(path), path
+    return path
+
+
+@pytest.mark.parametrize("header,enum_name,module,class_name", [
+    ("ggml/include/ggml.h", "ggml_type", "_ggml", "GGMLType"),
+    ("ggml/include/ggml.h", "ggml_ftype", "_ggml", "GGMLFType"),
+    ("ggml/include/ggml.h", "ggml_op", "_ggml", "GGML_OP"),
+    ("ggml/include/ggml.h", "ggml_prec", "_ggml", "GGMLPrec"),
+    ("ggml/include/ggml-opt.h", "ggml_opt_build_type", "_ggml", "GGMLOptBuildType"),
+    ("ggml/include/ggml-opt.h", "ggml_opt_optimizer_type", "_ggml", "GGMLOptOptimizerType"),
+    ("include/llama.h", "llama_ftype", "llama_cpp", "llama_ftype"),
+])
+def test_runtime_enums_match_vendor(header, enum_name, module, class_name):
+    source = (Path(__file__).resolve().parents[1] / "vendor/llama.cpp" / header).read_text(encoding="utf-8")
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+    body = re.search(r"\benum\s+" + enum_name + r"\s*\{([^}]+)\}", source)[1]
+    expected, value = {}, -1
+    for entry in body.split(","):
+        if not entry.strip():
+            continue
+        name, *explicit = entry.strip().split("=")
+        value = int(explicit[0].strip(), 0) if explicit else value + 1
+        expected[name.strip()] = value
+    enum_type = getattr(getattr(llama_cpp, module), class_name)
+    assert {name: int(value) for name, value in enum_type.__members__.items()} == expected
+
+
+def test_ggml_graph_and_fp8_layout():
+    g = llama_cpp._ggml
+    assert ctypes.sizeof(g.ggml_fp8_e4m3_t) == ctypes.alignment(g.ggml_fp8_e4m3_t) == 1
+    assert bytes(g.ggml_fp8_e4m3_t(bits=0xFE)) == b"\xfe"
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        assert ctypes.sizeof(g.ggml_cgraph) == 96
+        assert g.ggml_cgraph.uid.offset == 88
+        assert g.ggml_cgraph.order.offset == 80
+    # Read a native graph, including its tail and the allocation following it.
+    init = ctypes.CFUNCTYPE(ctypes.c_void_p, g.ggml_init_params)(("ggml_init", g.libggml_base))
+    free = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(("ggml_free", g.libggml_base))
+    new_graph = ctypes.CFUNCTYPE(ctypes.POINTER(g.ggml_cgraph), ctypes.c_void_p,
+                                ctypes.c_size_t, ctypes.c_bool)(("ggml_new_graph_custom", g.libggml_base))
+    ctx = init(g.ggml_init_params(65536, None, True))
+    assert ctx
+    try:
+        graph = new_graph(ctx, 16, False)
+        assert graph.contents.size == 16 and graph.contents.n_nodes == 0
+        assert graph.contents.uid == 0
+        assert ctypes.addressof(graph.contents.nodes.contents) >= ctypes.addressof(graph.contents) + ctypes.sizeof(g.ggml_cgraph)
+    finally:
+        free(ctx)
+
+
+def test_ggml_flash_attn_rows_and_comm_callbacks():
+    g = llama_cpp._ggml
+    bootstrap_type = g.ggml_backend_comm_bootstrap_callback
+    init_type = g.ggml_backend_comm_init_rank_t
+
+    @bootstrap_type
+    def bootstrap(user_data, send, recv, size):
+        assert user_data == 42
+        ctypes.memmove(recv, send, size)
+        return True
+
+    @init_type
+    def init_rank(backend, rank, world_size, callback, user_data):
+        assert (backend, rank, world_size) == (123, 0, 1)
+        source, target = ctypes.c_int(17), ctypes.c_int()
+        assert callback(user_data, ctypes.byref(source), ctypes.byref(target), ctypes.sizeof(source))
+        assert target.value == 17
+        return 456
+
+    assert init_rank(123, 0, 1, bootstrap, 42) == 456
+    rows = g.ggml_flash_attn_ext_rows
+    if getattr(rows, "__ctypes_optional__", False):
+        pytest.skip("Native ggml lacks flash attention with KV rows")
+    assert rows.argtypes == [g.ggml_context_p] + [g.ggml_tensor_p] * 5 + [ctypes.c_float] * 3
+    assert rows.restype is g.ggml_tensor_p
+    init = ctypes.CFUNCTYPE(g.ggml_context_p, g.ggml_init_params)(("ggml_init", g.libggml_base))
+    free = ctypes.CFUNCTYPE(None, g.ggml_context_p)(("ggml_free", g.libggml_base))
+    new = ctypes.CFUNCTYPE(g.ggml_tensor_p, g.ggml_context_p, ctypes.c_int,
+                           *([ctypes.c_int64] * 4))(("ggml_new_tensor_4d", g.libggml_base))
+    ctx = init(g.ggml_init_params(65536, None, True))
+    assert ctx
+    try:
+        q, k, v = (new(ctx, 0, *shape) for shape in ((4, 1, 1, 1), (4, 4, 1, 1), (4, 4, 1, 1)))
+        mask = new(ctx, 1, 2, 1, 1, 1)
+        indices = new(ctx, 26, 2, 1, 1, 1)
+        result = rows(ctx, q, k, v, mask, indices, 0.5, 0.0, 0.0)
+        assert result.contents.op == g.GGML_OP.GGML_OP_FLASH_ATTN_EXT
+        assert list(result.contents.ne) == [4, 1, 1, 1]
+        assert ctypes.addressof(result.contents.src[5].contents) == ctypes.addressof(indices.contents)
+        assert ctypes.cast(result.contents.op_params, ctypes.POINTER(ctypes.c_float))[0] == 0.5
+    finally:
+        free(ctx)
+
+
+def test_optional_model_and_device_extension_signatures():
+    lib = internals.llama_cpp
+    signatures = {
+        "llama_set_embeddings_layer_inp_dev": ([lib.llama_context_p_ctypes, ctypes.c_bool], None),
+        "llama_supports_embd_row": ([lib.llama_context_p_ctypes], ctypes.c_bool),
+        "llama_batch_ext_add_embd_row": ([lib.llama_batch_ext_p_ctypes, lib.llama_seq_id, ctypes.c_int32], ctypes.c_int32),
+        "llama_model_classifier_free_guidance": ([lib.llama_model_p_ctypes], ctypes.c_bool),
+    }
+    tree = ast.parse(Path(lib.__file__).read_text(encoding="utf-8"))
+    declarations = ast.Module(body=[node for node in tree.body
+                                   if isinstance(node, ast.FunctionDef) and node.name in signatures], type_ignores=[])
+    recorded = {}
+
+    def bind(names, args, result, **kwargs):
+        recorded[names[0]] = (args, result)
+        assert len(names) == 4 and kwargs == {"required": False}
+        return lambda function: function
+
+    exec(compile(declarations, lib.__file__, "exec"), dict(vars(lib), ctypes_function_llama_ext=bind))
+    assert recorded == signatures
+    for name, (args, result) in signatures.items():
+        function = getattr(lib, name)
+        if not getattr(function, "__ctypes_optional__", False):
+            assert function.argtypes == args and function.restype is result
+
+
+def test_ggml_batch_transfer_signatures():
+    g = llama_cpp._ggml
+    ptr = ctypes.POINTER
+    signatures = {
+        "ggml_backend_tensor_copy_n": [ptr(g.ggml_tensor_p), ptr(g.ggml_tensor_p), ctypes.c_size_t],
+        "ggml_backend_tensor_set_n": [ptr(g.ggml_tensor_p), ctypes.c_void_p, ptr(ctypes.c_size_t),
+                                      ptr(ctypes.c_size_t), ptr(ctypes.c_size_t), ctypes.c_size_t],
+        "ggml_backend_tensor_get_n": [ptr(g.ggml_tensor_p), ctypes.c_void_p, ptr(ctypes.c_size_t),
+                                      ptr(ctypes.c_size_t), ptr(ctypes.c_size_t), ctypes.c_size_t],
+    }
+    # Validate declarations even when CI's native library predates these symbols.
+    tree = ast.parse(Path(g.__file__).read_text(encoding="utf-8"))
+    declarations = ast.Module(body=[node for node in tree.body
+                                   if isinstance(node, ast.FunctionDef) and node.name in signatures], type_ignores=[])
+    recorded = {}
+
+    def bind(name, args, result, **kwargs):
+        recorded[name] = (args, result)
+        return lambda function: function
+
+    exec(compile(declarations, g.__file__, "exec"), dict(vars(g), ggml_base_function=bind))
+    assert recorded == {name: (args, None) for name, args in signatures.items()}
+    for name, args in signatures.items():
+        function = getattr(g, name)
+        if getattr(function, "__ctypes_optional__", False):
+            with pytest.raises(RuntimeError, match=name):
+                function(*([None] * (len(args) - 1)), 0)
+        else:
+            assert function.argtypes == args and function.restype is None
+            function(*([None] * (len(args) - 1)), 0)
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batched"])
+def test_ggml_tensor_transfer_roundtrip(batched):
+    g = llama_cpp._ggml
+    if batched and any(getattr(getattr(g, "ggml_backend_tensor_" + op + "_n"), "__ctypes_optional__", False)
+                       for op in ("set", "get", "copy")):
+        pytest.skip("Native ggml lacks batched tensor transfers")
+    buft = g.ggml_backend_cpu_buffer_type()
+    alignment = g.ggml_backend_buft_get_alignment(buft)
+    storage, tensors, buffers = [], [], []
+    try:
+        for _ in range(4):
+            tensor = g.ggml_tensor(type=g.GGMLType.GGML_TYPE_F32, ne=(4, 1, 1, 1), nb=(4, 16, 16, 16))
+            # ctypes arrays do not guarantee the backend's required alignment.
+            size = g.ggml_backend_buft_get_alloc_size(buft, ctypes.byref(tensor))
+            buffer = g.ggml_backend_buft_alloc_buffer(buft, size)
+            assert buffer
+            buffers.append(buffer)
+            address = g.ggml_backend_buffer_get_base(buffer)
+            assert address and address % alignment == 0
+            assert g.ggml_backend_tensor_alloc(buffer, ctypes.byref(tensor), address) == 0
+            g.ggml_backend_buffer_clear(buffer, 0)
+            tensors.append(tensor)
+            storage.append((ctypes.c_float * 4).from_address(address))
+        sources = (g.ggml_tensor_p * 2)(*(ctypes.pointer(t) for t in tensors[:2]))
+        targets = (g.ggml_tensor_p * 2)(*(ctypes.pointer(t) for t in tensors[2:]))
+        pair = ctypes.c_size_t * 2
+        data = (ctypes.c_float * 4)(10, 11, 12, 13)
+        if batched:
+            g.ggml_backend_tensor_set_n(sources, data, pair(4, 8), pair(8, 4), pair(0, 12), 2)
+        else:
+            g.ggml_backend_tensor_set(sources[0], data, 4, 8)
+            g.ggml_backend_tensor_set(sources[1], ctypes.byref(data, 12), 8, 4)
+        assert list(storage[0]) == [0, 10, 11, 0]
+        assert list(storage[1]) == [0, 0, 13, 0]
+        if batched:
+            g.ggml_backend_tensor_copy_n(sources, targets, 2)
+        else:
+            for source, target in zip(sources, targets):
+                g.ggml_backend_tensor_copy(source, target)
+        result = (ctypes.c_float * 14)(*([-99] * 14))
+        if batched:
+            g.ggml_backend_tensor_get_n(targets, result, pair(0, 0), pair(16, 16), pair(8, 32), 2)
+        else:
+            for target, offset in zip(targets, (8, 32)):
+                g.ggml_backend_tensor_get(target, ctypes.byref(result, offset), 0, 16)
+        assert list(result) == [-99, -99, 0, 10, 11, 0, -99, -99, 0, 0, 13, 0, -99, -99]
+    finally:
+        for buffer in reversed(buffers):
+            g.ggml_backend_buffer_free(buffer)
 
 
 def test_model_suppress_tokens_copies_native_storage(monkeypatch):
@@ -218,9 +454,7 @@ def test_real_multimodal_embedding_entrypoint_readiness(profile, width, pooling,
                             assert all(isinstance(pos, int) for pos in chunk.positions)
                         else:
                             assert all(len(pos) == 4 for pos in chunk.positions)
-                    native = llama_cpp.llama_batch_ext_init(model._ctx.ctx)
-                    assert native
-                    try:
+                    with _native_batch(model._ctx.ctx) as native:
                         for chunk in encoded:
                             rows = chunk.tokens if chunk.tokens else chunk.embeddings
                             for row, pos in zip(rows, chunk.positions):
@@ -236,8 +470,6 @@ def test_real_multimodal_embedding_entrypoint_readiness(profile, width, pooling,
                         assert llama_cpp.llama_process(model._ctx.ctx, llama_cpp.llama_process_type.LLAMA_PROCESS_TYPE_DECODE, native) == 0
                         raw = np.ctypeslib.as_array(model._ctx.get_embeddings_seq(0), shape=(width,)).copy()
                         assert np.dot(vector, raw / np.linalg.norm(raw)) > 0.99999
-                    finally:
-                        llama_cpp.llama_batch_ext_free(native)
                 model.reset()
             handler.is_support_vision = False
             with pytest.raises(ValueError, match="does not support image"):
@@ -257,16 +489,12 @@ def test_real_multimodal_embedding_entrypoint_readiness(profile, width, pooling,
 @pytest.fixture
 def runtime_context(monkeypatch):
     ctx = internals.LlamaContext.__new__(internals.LlamaContext)
-    ctx.ctx = 123
-    ctx.model = SimpleNamespace(
-        n_vocab=lambda: 100,
-        rope_type=lambda: internals.llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
+    ctx.__dict__.update(
+        ctx=123, params=object(), verbose=False,
+        _loras_applied=False, _cvec_applied=False, _lora_refs=(),
+        model=SimpleNamespace(n_vocab=lambda: 100,
+                              rope_type=lambda: llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE),
     )
-    ctx.params = object()
-    ctx.verbose = False
-    ctx._loras_applied = False
-    ctx._cvec_applied = False
-    ctx._lora_refs = ()
     monkeypatch.setattr(internals.llama_cpp, "llama_free", Mock())
     monkeypatch.setattr(internals.llama_cpp, "llama_n_batch", lambda _: 3)
     monkeypatch.setattr(internals.llama_cpp, "llama_n_seq_max", lambda _: 2)
@@ -302,6 +530,11 @@ def batch_runtime(runtime_context, monkeypatch):
         idx = add(p, sid, None)
         return idx if payload(p, idx, embd, "embedding") else -2
 
+    def add_embd_row(p, sid, row):
+        idx = add(p, sid, None)
+        rows[idx]["embd_row"] = row
+        return -2 if state.fail == "embd_row" else idx
+
     def sequence(_, idx, sid):
         rows[idx]["seq_ids"].append(sid)
         return True
@@ -321,6 +554,7 @@ def batch_runtime(runtime_context, monkeypatch):
 
     monkeypatch.setattr(lib, "llama_batch_ext_add_token", add)
     monkeypatch.setattr(lib, "llama_batch_ext_add_embd", add_embd)
+    monkeypatch.setattr(lib, "llama_batch_ext_add_embd_row", add_embd_row)
     monkeypatch.setattr(lib, "llama_batch_ext_set_embd_token", lambda *args: payload(*args, "embedding"))
     monkeypatch.setattr(lib, "llama_batch_ext_set_embd_state", lambda *args: payload(*args, "state"))
     monkeypatch.setattr(lib, "llama_batch_ext_add_seq", sequence)
@@ -366,7 +600,7 @@ def test_multimodal_pooling_attention_and_failure_contract(batch_runtime, tmp_pa
     monkeypatch.setattr(r.context, "set_embeddings", Mock())
     monkeypatch.setattr(r.context, "get_embeddings_seq", lambda seq: raw.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
     model = SimpleNamespace(_ctx=r.context, context_params=SimpleNamespace(embeddings=True),
-                            n_ctx=lambda: 3, n_embd_out=lambda: 2, reset=Mock())
+                            n_ctx=lambda: 6, n_ctx_seq=lambda: 3, n_embd_out=lambda: 2, reset=Mock())
     chunks = (
         MTMDEncodedChunk(0, (1,), None, (0,), 1, False),
         MTMDEncodedChunk(1, (), np.ones((1, 2), dtype=np.float32), ((1, 2, 3, 0),), 1, media_non_causal),
@@ -398,11 +632,82 @@ def test_multimodal_pooling_attention_and_failure_contract(batch_runtime, tmp_pa
         assert model.reset.call_count == len(released) * 2
         r.context.set_causal_attn.assert_not_called()
         assert r.context.get_causal_attn() is causal
+        # Fits total capacity (6), but exceeds this sequence's positional budget (3).
+        resets = model.reset.call_count
+        request.n_pos = 4
+        with pytest.raises(ValueError, match="must fit one microbatch"):
+            handler.embed(model, "prompt")
+        assert model.reset.call_count == resets
 
 
 class MockLoraAdapter:
     def __init__(self, address):
         self.adapter = ctypes.cast(ctypes.c_void_p(address), internals.llama_cpp.llama_adapter_lora_p_ctypes)
+
+
+def test_llama_context_wraps_backend_sampling_and_perf(runtime_context, monkeypatch):
+    context = runtime_context
+    context._sampler_refs = {}
+    sampler = type("Sampler", (), {"sampler": "native-sampler"})()
+    calls = []
+    monkeypatch.setattr(internals.llama_cpp, "llama_synchronize", lambda ctx: calls.append(("sync", ctx)))
+
+    monkeypatch.setattr(
+        internals.llama_cpp,
+        "llama_set_sampler",
+        lambda ctx, seq_id, ptr: calls.append(("set", ctx, seq_id, ptr)) or True,
+    )
+    assert context.set_sampler(2, sampler)
+    assert context._sampler_refs[2] is sampler
+    assert context.set_sampler(2, None)
+    assert 2 not in context._sampler_refs
+    assert calls == [("sync", 123), ("set", 123, 2, "native-sampler"),
+                     ("sync", 123), ("set", 123, 2, None)]
+
+    results = {
+        "llama_get_sampled_probs_ith": object(),
+        "llama_get_sampled_logits_ith": object(),
+        "llama_get_sampled_candidates_ith": object(),
+        "llama_get_sampled_token_ith": 17,
+        "llama_get_sampled_probs_count_ith": 3,
+        "llama_get_sampled_logits_count_ith": 4,
+        "llama_get_sampled_candidates_count_ith": 5,
+    }
+    for name, result in results.items():
+        monkeypatch.setattr(internals.llama_cpp, name,
+                            lambda ctx, index, result=result, name=name: calls.append((name, ctx, index)) or result)
+        assert getattr(context, name.removeprefix("llama_"))(-1) == result
+        assert calls[-1] == (name, 123, -1)
+
+    perf = llama_cpp.llama_perf_context_data()
+    perf.n_eval = 9
+    monkeypatch.setattr(internals.llama_cpp, "llama_perf_context", lambda ctx: perf)
+    assert context.perf_context().n_eval == 9
+    for action, method in (("print", "print_timings"), ("reset", "reset_timings")):
+        monkeypatch.setattr(internals.llama_cpp, f"llama_perf_context_{action}",
+                            lambda ctx, action=action: calls.append((f"perf-{action}", ctx)))
+        getattr(context, method)()
+        assert calls[-1] == (f"perf-{action}", 123)
+
+
+@pytest.mark.parametrize("failure", ["sync", "native", "rejected"])
+def test_sampler_change_failure_tracks_native_ownership(runtime_context, monkeypatch, failure):
+    context = runtime_context
+    owner = SimpleNamespace(sampler=456)
+    context._sampler_refs = {0: owner}
+    sync = Mock(side_effect=RuntimeError("sync") if failure == "sync" else None)
+    change = Mock(side_effect=RuntimeError("native") if failure == "native" else None, return_value=False)
+    monkeypatch.setattr(internals.llama_cpp, "llama_synchronize", sync)
+    monkeypatch.setattr(internals.llama_cpp, "llama_set_sampler", change)
+    if failure == "rejected":
+        assert context.set_sampler(0, SimpleNamespace(sampler=789)) is False
+        assert not context._sampler_refs
+    else:
+        with pytest.raises(RuntimeError, match=failure):
+            context.set_sampler(0, None)
+        assert context._sampler_refs[0] is owner
+    if failure == "sync":
+        change.assert_not_called()
 
 
 def test_closed_context_rejected_before_native_call(runtime_context, monkeypatch):
@@ -526,6 +831,65 @@ def test_context_close_attempts_all_resources_and_frees_once(runtime_context, mo
     context._batch_ext_refs = []
     context.close()
     assert events.count("native") == 1
+
+
+def test_device_row_ranges_reject_mixed_inputs_and_recover_after_native_failure(batch_runtime):
+    r = batch_runtime
+    r.batch.add_token(1, 0)
+    r.batch.add_embd_row(7, (1, 2, 3, 0), seq_ids=(0, 1), output=True)
+    r.batch.add_embd_row(9, (4, 5, 6, 0))
+    for row in (-1, 2**31, True, 1.5):
+        with pytest.raises((ValueError, TypeError), match="embd_row"):
+            r.batch.add_embd_row(row, (7, 7, 7, 0))
+    assert len(r.batch) == 3
+    with pytest.raises(ValueError, match="Device rows cannot mix"):
+        r.context.decode(r.batch)
+    assert r.calls == r.rows == []
+    r.state.fail = "embd_row"
+    with pytest.raises(RuntimeError, match="Native batch add failed"):
+        r.context.decode(r.batch, start=1, count=2)
+    assert r.calls == r.rows == []
+    r.state.fail = False
+    assert r.context.decode(r.batch, start=1, count=2) == 0
+    assert r.rows == [
+        dict(token=None, seq_ids=[0, 1], embd_row=7, position=(1, 2, 3, 0), output=True),
+        dict(token=None, seq_ids=[0], embd_row=9, position=(4, 5, 6, 0)),
+    ]
+    assert r.batch.submitted_indices == (1, 2) and r.batch.output_indices == (1,)
+
+
+@pytest.mark.parametrize("status", [0, 1, -1])
+def test_dflash_device_injection_uses_original_rows_across_chunks(batch_runtime, monkeypatch, status):
+    from llama_cpp.llama_speculative import LlamaDFlashDecoding
+
+    r = batch_runtime
+    monkeypatch.setattr(internals.llama_cpp, "llama_n_ubatch", lambda _: 2)
+    snapshots = []
+
+    def process(*args):
+        snapshots.append([dict(row) for row in r.rows])
+        return status if len(snapshots) == 2 else 0
+
+    monkeypatch.setattr(internals.llama_cpp, "llama_process", process)
+    engine = object.__new__(LlamaDFlashDecoding)
+    engine._use_dev_features, engine.is_mrope, engine.is_lilicorr = True, True, False
+    engine.n_embd_enc = 6
+    engine.draft_context, engine.inject_batch = r.context, r.batch
+    engine._gather_target_features = Mock(side_effect=AssertionError("Unexpected host copy"))
+    batch = SimpleNamespace(n_tokens=5, token=[1] * 5, embd=None, pos=list(range(11, 16)),
+                            n_seq_id=[1] * 5, seq_id=[[0]] * 5)
+    if status:
+        message = "code -1" if status < 0 else "status 1 at feature row offset 2"
+        with pytest.raises(RuntimeError, match=message):
+            engine.process(batch)
+    else:
+        engine.process(batch)
+        assert engine.verify_positions == batch.pos and engine.verify_features.shape == (0, 6)
+    rows = [row for chunk in snapshots for row in chunk]
+    count = 4 if status else 5
+    assert [row["embd_row"] for row in rows] == list(range(count))
+    assert [row["position"] for row in rows] == [(p, p, p, 0) for p in range(11, 11 + count)]
+    assert all(row["token"] is None and "embedding" not in row and not row.get("output") for row in rows)
 
 
 def test_interleaved_range_preserves_positions_and_output_mapping(batch_runtime):
@@ -914,29 +1278,18 @@ def test_private_completion_respects_ignore_eos_at_eog_boundary(
         forwarded.append(kwargs["ignore_eos"])
         yield 2
 
-    llm._model = SimpleNamespace(
-        vocab=object(),
-        token_bos=lambda: 1,
-        token_eos=lambda: 2,
-        token_sep=lambda: -1,
-        token_fim_pre=lambda: -1,
-        token_fim_mid=lambda: -1,
-        token_fim_suf=lambda: -1,
-        get_add_sep=lambda: False,
+    llm.__dict__.update(
+        _model=SimpleNamespace(
+            vocab=object(), token_bos=lambda: 1, token_eos=lambda: 2,
+            token_sep=lambda: -1, token_fim_pre=lambda: -1,
+            token_fim_mid=lambda: -1, token_fim_suf=lambda: -1,
+            get_add_sep=lambda: False,
+        ),
+        _abort_event=threading.Event(), metadata={}, spm_infill=False, verbose=False,
+        _n_ctx=8, _logits_all=False, _seed=0, cache=None, model_path="fake.gguf",
+        input_ids=np.zeros(8, dtype=np.intc), n_tokens=1, scores=np.zeros((1, 4), dtype=np.float32),
+        generate=fake_generate,
     )
-    llm._abort_event = threading.Event()
-    llm.metadata = {}
-    llm.spm_infill = False
-    llm.verbose = False
-    llm._n_ctx = 8
-    llm._logits_all = False
-    llm._seed = 0
-    llm.cache = None
-    llm.model_path = "fake.gguf"
-    llm.input_ids = np.zeros(8, dtype=np.intc)
-    llm.n_tokens = 1
-    llm.scores = np.zeros((1, 4), dtype=np.float32)
-    llm.generate = fake_generate
     llm.detokenize = (
         lambda tokens, prev_tokens=None, **kwargs: b"".join(
             b"<eog>" if token == 2 else b"x" for token in tokens
@@ -947,12 +1300,7 @@ def test_private_completion_respects_ignore_eos_at_eog_boundary(
         lambda vocab, token: token == 2,
     )
 
-    result = next(
-        llm._create_completion(
-            prompt=[1], max_tokens=1, ignore_eos=ignore_eos
-        )
-    )
-
+    result = next(llm._create_completion(prompt=[1], max_tokens=1, ignore_eos=ignore_eos))
     assert forwarded == [ignore_eos]
     assert result["choices"][0]["text"] == expected_text
     assert result["choices"][0]["finish_reason"] == expected_finish_reason
@@ -985,19 +1333,14 @@ def test_context_manages_borrowed_threadpool_and_abort_callback_lifetimes(runtim
 def test_decode_eval_batch_resets_and_preserves_native_abort(monkeypatch):
     llm = object.__new__(llama_cpp.Llama)
     llm._batch = SimpleNamespace(batch=SimpleNamespace(n_tokens=0))
-    llm._ctx = SimpleNamespace(
-        decode=lambda _batch: (_ for _ in ()).throw(
-            internals.LlamaDecodeAbort("native abort")
-        )
-    )
+    llm._ctx = SimpleNamespace(decode=Mock(side_effect=internals.LlamaDecodeAbort("native abort")))
     llm._active_speculative_phase_stats = None
-    reset_calls = []
-    monkeypatch.setattr(llm, "reset", lambda: reset_calls.append(True))
+    monkeypatch.setattr(llm, "reset", Mock())
 
     with pytest.raises(internals.LlamaDecodeAbort, match="native abort"):
         llm._decode_eval_batch([1, 2], 2)
 
-    assert reset_calls == [True]
+    llm.reset.assert_called_once_with()
 
 
 def test_high_level_abort_updates_python_and_native_flags():
@@ -1023,6 +1366,8 @@ def vocabulary_model():
 def test_model_extensions_with_vocabulary_only_model(vocabulary_model):
     model = vocabulary_model._model.model
     assert llama_cpp.llama_model_n_tokens_delay(model) == 0
+    if not getattr(llama_cpp.llama_model_classifier_free_guidance, "__ctypes_optional__", False):
+        assert vocabulary_model._model.classifier_free_guidance() is False
     llama_cpp.llama_model_set_attn_rot(model, False)
     llama_cpp.llama_model_set_attn_rot(model, True)
     llama_cpp.llama_model_set_attn_rot(model, False)
@@ -1033,28 +1378,18 @@ def test_model_extensions_with_vocabulary_only_model(vocabulary_model):
 
 
 def test_llama_cpp_tokenization(vocabulary_model):
-    """
-    Test the tokenizer API (Llama.tokenize and Llama.detokenize).
-    Verifies handling of BOS (Begin of Sentence), EOS (End of Sentence), and special tokens.
-    """
     llama = vocabulary_model
-    text = b"Hello World"
-
-    tokens = llama.tokenize(text)
-    assert tokens == [llama.token_bos(), 15043, 2787]
-    assert llama.detokenize(tokens)[1:] == text
-
-    tokens = llama.tokenize(text, add_bos=False)
-    assert tokens == [15043, 2787]
-    assert llama.detokenize(tokens) == text
-
-    text = b"Hello World</s>"
-    assert llama.tokenize(text) == [1, 15043, 2787, 829, 29879, 29958]
-    assert llama.tokenize(text, special=True) == [1, 15043, 2787, llama.token_eos()]
-
-    tokens = llama.tokenize(b"", add_bos=True, special=True)
-    assert tokens == [llama.token_bos()]
-    assert llama.detokenize(tokens) == b""
+    for text, options, expected, skip in (
+        (b"Hello World", {}, [llama.token_bos(), 15043, 2787], 1),
+        (b"Hello World", {"add_bos": False}, [15043, 2787], 0),
+        (b"Hello World</s>", {}, [1, 15043, 2787, 829, 29879, 29958], None),
+        (b"Hello World</s>", {"special": True}, [1, 15043, 2787, llama.token_eos()], None),
+        (b"", {"add_bos": True, "special": True}, [llama.token_bos()], 0),
+    ):
+        tokens = llama.tokenize(text, **options)
+        assert tokens == expected, (text, options)
+        if skip is not None:
+            assert llama.detokenize(tokens)[skip:] == text, (text, options)
 
 
 @pytest.mark.parametrize('kind', ['sequence', 'mixed', 'mrope'])
@@ -1086,13 +1421,7 @@ def test_legacy_batch_input_validation_and_native_layout(kind):
 
 @pytest.fixture(scope="module")
 def llama_cpp_model_path():
-    model_path = os.environ.get("LLAMA_TEST_TRANSFORMER_MODEL")
-    if not model_path:
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            pytest.fail("LLAMA_TEST_TRANSFORMER_MODEL is required in Actions")
-        pytest.skip("Set LLAMA_TEST_TRANSFORMER_MODEL to run real-model tests")
-    assert os.path.isfile(model_path), model_path
-    return model_path
+    return _required_model_path("LLAMA_TEST_TRANSFORMER_MODEL")
 
 
 @pytest.fixture(scope="module")
@@ -1101,15 +1430,9 @@ def shared_completion_model(llama_cpp_model_path):
     with closing(llama_cpp.Llama(
         llama_cpp_model_path,
         n_gpu_layers=int(os.environ.get("LLAMA_TEST_N_GPU_LAYERS", "0")),
-        verbose=False,
-        n_ctx=64,
-        n_batch=32,
-        n_ubatch=32,
-        n_threads=multiprocessing.cpu_count(),
-        n_threads_batch=multiprocessing.cpu_count(),
-        logits_all=False,
-        swa_full=True,
-        kv_unified=True,
+        n_ctx=64, n_batch=32, n_ubatch=32, verbose=False,
+        n_threads=multiprocessing.cpu_count(), n_threads_batch=multiprocessing.cpu_count(),
+        logits_all=False, swa_full=True, kv_unified=True,
     )) as model:
         yield model
 
@@ -1131,13 +1454,44 @@ def completion_logits_reference(shared_completion_model):
     try:
         tokens = model.tokenize(b"Hello", add_bos=True)
         model.eval(tokens)
-        logits = np.ctypeslib.as_array(
-            model._ctx.get_logits_ith(-1), shape=(model.n_vocab(),)
-        ).copy()
+        logits = _last_logits(model).copy()
         logits.flags.writeable = False
         return tokens, logits
     finally:
         model.reset()
+
+
+@pytest.mark.parametrize("unified", [False, True], ids=["partitioned", "unified"])
+def test_single_sequence_budget_matches_native_capacity(llama_cpp_model_path, unified, monkeypatch):
+    with closing(llama_cpp.Llama(model_path=llama_cpp_model_path, n_ctx=512, n_batch=512,
+                                n_ubatch=512, n_seq_max=2, kv_unified=unified,
+                                embeddings=True, pooling_type=llama_cpp.LLAMA_POOLING_TYPE_NONE,
+                                n_gpu_layers=int(os.environ.get("LLAMA_TEST_N_GPU_LAYERS", "0")),
+                                verbose=False)) as model:
+        capacity = model._ctx.n_ctx_seq()
+        assert model.n_ctx() == model._ctx.n_ctx() == 512
+        assert capacity == (512 if unified else 256)
+        assert model._n_ctx == model.n_ctx_seq() == len(model.input_ids) == capacity
+        token = model.tokenize(b" hello", add_bos=False)[0]
+        # Reject oversized prompts before decoding, then fill and shift a valid sequence.
+        with pytest.raises(ValueError, match=f"exceed context window of {capacity}"):
+            model.create_completion([token] * capacity, max_tokens=1)
+        with pytest.raises(RuntimeError, match="larger than the entire context window"):
+            model.eval([token] * (capacity + 1))
+        model.eval([token] * capacity)
+        model.eval([token])
+        assert model.n_tokens <= capacity
+        assert model.create_completion([token] * 8, max_tokens=1, temperature=0)["choices"]
+        decode = Mock(wraps=model._ctx.decode)
+        monkeypatch.setattr(model._ctx, "decode", decode)
+        with pytest.raises(ValueError, match="exceed"):
+            model.embed([[token] * (capacity + 1)], truncate=False)
+        decode.assert_not_called()
+        length = capacity * 3 // 5
+        rows, count = model.embed([[token] * length] * 2, truncate=False, return_count=True)
+        assert count == 2 * length and [len(row) for row in rows] == [length, length]
+        assert decode.call_count == (2 if unified else 1)
+        assert all(np.isfinite(row).all() for row in rows)
 
 
 def test_backend_sampling_with_varying_extended_batch_outputs(completion_model):
@@ -1216,16 +1570,12 @@ def test_context_graph_reserve_preserves_decode_results(completion_model, comple
         position = model._ctx.memory_seq_pos_max(0)
         assert model._ctx.graph_reserve(len(tokens), 1, 1)
         assert model._ctx.memory_seq_pos_max(0) == position
-        actual = np.ctypeslib.as_array(
-            model._ctx.get_logits_ith(-1), shape=(model.n_vocab(),)
-        )
+        actual = _last_logits(model)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
         batch.reset()
         batch.add_token(tokens[-1], len(tokens), output=True)
         assert model._ctx.decode(batch) == 0
-        assert np.isfinite(np.ctypeslib.as_array(
-            model._ctx.get_logits_ith(-1), shape=(model.n_vocab(),)
-        )).all()
+        assert np.isfinite(_last_logits(model)).all()
 
 
 def test_high_level_interleaved_batch_matches_native_submission(completion_model):
@@ -1234,15 +1584,10 @@ def test_high_level_interleaved_batch_matches_native_submission(completion_model
     token = model.tokenize(b"Hello", add_bos=True)[0]
     width = model.n_embd_inp()
     embedding = np.zeros(width, dtype=np.float32)
-    use_mrope = model._model.rope_type() in (
-        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
-        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_IMROPE,
-    )
+    use_mrope = _uses_mrope(model)
     # Compare identical submission shapes: quantized/hybrid models need
     # not produce identical logits for joint vs separate decode calls.
-    native = llama_cpp.llama_batch_ext_init(ctx.ctx)
-    assert native
-    try:
+    with _native_batch(ctx.ctx) as native:
         embd = llama_cpp.llama_embd(embedding.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), 1, width)
         for i in range(3):
             idx = (
@@ -1254,27 +1599,20 @@ def test_high_level_interleaved_batch_matches_native_submission(completion_model
             assert llama_cpp.llama_batch_ext_set_pos(native, idx, pos)
             assert llama_cpp.llama_batch_ext_set_output_logits(native, idx, i == 2)
         assert llama_cpp.llama_process(ctx.ctx, llama_cpp.llama_process_type.LLAMA_PROCESS_TYPE_DECODE, native) == 0
-        expected = np.ctypeslib.as_array(ctx.get_logits_ith(-1), shape=(model.n_vocab(),)).copy()
-    finally:
-        llama_cpp.llama_batch_ext_free(native)
+        expected = _last_logits(model, ctx).copy()
     model.reset()
     with internals.LlamaBatchExt(context=ctx) as batch:
         batch.add_token(token, 0)
         batch.add_embedding(embedding, (1, 1, 1, 0) if use_mrope else 1)
         batch.add_token(token, 2, output=True)
         assert ctx.decode(batch) == 0
-        actual = np.ctypeslib.as_array(ctx.get_logits_ith(-1), shape=(model.n_vocab(),))
+        actual = _last_logits(model, ctx)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 @pytest.fixture(scope="module")
 def shared_mtp_runtime():
-    model_path = os.environ.get("LLAMA_TEST_HYBRID_MODEL")
-    if not model_path:
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            pytest.fail("LLAMA_TEST_HYBRID_MODEL is required in Actions")
-        pytest.skip("Set LLAMA_TEST_HYBRID_MODEL to run real MTP tests")
-    assert os.path.isfile(model_path), model_path
+    model_path = _required_model_path("LLAMA_TEST_HYBRID_MODEL")
     with closing(llama_cpp.Llama(
         model_path, load_mtp=True, n_ctx=64, n_batch=32, n_ubatch=32,
         n_gpu_layers=int(os.environ.get("LLAMA_TEST_N_GPU_LAYERS", "0")),
@@ -1309,19 +1647,14 @@ def test_extended_state_batch_matches_native_mtp(mtp_runtime, input_kind):
     hidden = rng.normal(0, 0.1, width).astype(np.float32)
     token = model.tokenize(b"Hello", add_bos=True)[0]
     embedding = rng.normal(0, 0.1, model._model.n_embd_inp()).astype(np.float32)
-    mrope = model._model.rope_type() in (
-        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
-        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_IMROPE,
-    )
+    mrope = _uses_mrope(model)
     position = (0, 1, 2, 0) if mrope else 0
     if input_kind == "token":
         with closing(internals.LlamaBatch(n_tokens=1, embd=width, n_seq_max=1, mixed=True)) as old:
             old.add_token_embedding(token, hidden, 0, [0], True)
             assert draft.decode(old) == 0
     else:
-        native = llama_cpp.llama_batch_ext_init(draft.ctx)
-        assert native
-        try:
+        with _native_batch(draft.ctx) as native:
             embd = llama_cpp.llama_embd(embedding.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), 1, embedding.size)
             state = llama_cpp.llama_embd(hidden.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), 1, hidden.size)
             idx = llama_cpp.llama_batch_ext_add_embd(native, 0, embd)
@@ -1331,9 +1664,7 @@ def test_extended_state_batch_matches_native_mtp(mtp_runtime, input_kind):
             assert llama_cpp.llama_batch_ext_set_pos(native, idx, pos)
             assert llama_cpp.llama_batch_ext_set_output_logits(native, idx, True)
             assert llama_cpp.llama_process(draft.ctx, llama_cpp.llama_process_type.LLAMA_PROCESS_TYPE_DECODE, native) == 0
-        finally:
-            llama_cpp.llama_batch_ext_free(native)
-    expected = np.ctypeslib.as_array(draft.get_logits_ith(-1), shape=(model.n_vocab(),)).copy()
+    expected = _last_logits(model, draft).copy()
     draft.memory_clear(True)
     with internals.LlamaBatchExt(context=draft) as batch:
         if input_kind == "token":
@@ -1341,7 +1672,7 @@ def test_extended_state_batch_matches_native_mtp(mtp_runtime, input_kind):
         else:
             batch.add_embedding(embedding, position, output=True, state=hidden)
         assert draft.decode(batch) == 0
-        actual = np.ctypeslib.as_array(draft.get_logits_ith(-1), shape=(model.n_vocab(),))
+        actual = _last_logits(model, draft)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
 
@@ -1356,10 +1687,7 @@ def test_extended_batch_native_gc_and_context_cleanup(completion_model, monkeypa
 
     monkeypatch.setattr(internals.llama_cpp, "llama_batch_ext_free", release)
     data = np.zeros((2, model.n_embd_inp()), dtype=np.float32)
-    mrope = model._model.rope_type() in (
-        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
-        llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_IMROPE,
-    )
+    mrope = _uses_mrope(model)
     positions = [(0, 0, 0, 0), (1, 1, 1, 0)] if mrope else [0, 1]
     for _ in range(3):
         batch = internals.LlamaBatchExt(context=model._ctx)
@@ -1386,12 +1714,34 @@ def test_extended_batch_native_gc_and_context_cleanup(completion_model, monkeypa
         context.close()
 
 
+def test_device_capture_rejects_row_decode_on_regular_context(completion_model):
+    model = completion_model
+    ctx = model._ctx
+    names = ("llama_set_embeddings_layer_inp_dev", "llama_supports_embd_row", "llama_batch_ext_add_embd_row")
+    if any(getattr(getattr(internals.llama_cpp, name), "__ctypes_optional__", False) for name in names):
+        pytest.skip("Native llama.cpp lacks device feature extensions")
+    model.reset()
+    try:
+        ctx.set_embeddings_layer_inp(0, True)
+        ctx.set_embeddings_layer_inp_dev(True)
+        assert not ctx.supports_embd_row()
+        with _native_batch(ctx.ctx) as batch:
+            assert llama_cpp.llama_batch_ext_add_embd_row(batch, 0, -1) == -2
+            llama_cpp.llama_batch_ext_clear(batch)
+            assert llama_cpp.llama_batch_ext_add_embd_row(batch, 0, 0) == 0
+            positions = (llama_cpp.llama_pos * 4)(0, 0, 0, 0)
+            assert llama_cpp.llama_batch_ext_set_pos(batch, 0, positions)
+            assert llama_cpp.llama_process(ctx.ctx, llama_cpp.llama_process_type.LLAMA_PROCESS_TYPE_DECODE, batch) == -1
+    finally:
+        ctx.set_embeddings_layer_inp_dev(False)
+        ctx.set_embeddings_layer_inp(0, False)
+        model.reset()
+
+
 def test_extended_batch_matches_legacy_decode(completion_model, completion_logits_reference, tmp_path):
     model = completion_model
     tokens, expected = completion_logits_reference
-    batch = llama_cpp.llama_batch_ext_init(model._ctx.ctx)
-    assert batch
-    try:
+    with _native_batch(model._ctx.ctx) as batch:
         assert llama_cpp.llama_batch_ext_add_token(batch, -1, tokens[0]) == -3
         assert llama_cpp.llama_batch_ext_add_token(batch, 0, llama_cpp.LLAMA_TOKEN_NULL) == -2
         # Invalid token input leaves an empty entry in the native batch.
@@ -1405,7 +1755,7 @@ def test_extended_batch_matches_legacy_decode(completion_model, completion_logit
             assert llama_cpp.llama_batch_ext_set_pos(batch, idx, ctypes.byref(llama_cpp.llama_pos(pos)))
             assert llama_cpp.llama_batch_ext_set_output_logits(batch, idx, pos == len(tokens) - 1)
         assert llama_cpp.llama_process(model._ctx.ctx, llama_cpp.llama_process_type.LLAMA_PROCESS_TYPE_DECODE, batch) == 0
-        actual = np.ctypeslib.as_array(model._ctx.get_logits_ith(-1), shape=(model.n_vocab(),))
+        actual = _last_logits(model)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
         assert llama_cpp.llama_state_seq_get_size(model._ctx.ctx, 0) == llama_cpp.llama_state_seq_get_size_ext(
             model._ctx.ctx, 0, llama_cpp.LLAMA_STATE_SEQ_FLAGS_NONE
@@ -1442,10 +1792,7 @@ def test_extended_batch_matches_legacy_decode(completion_model, completion_logit
         width = model.n_embd_inp()
         zeros = (ctypes.c_float * width)()
         embd = llama_cpp.llama_embd(zeros, 1, width)
-        use_mrope = model._model.rope_type() in (
-            llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_MROPE,
-            llama_cpp.llama_rope_type.LLAMA_ROPE_TYPE_IMROPE,
-        )
+        use_mrope = _uses_mrope(model)
         legacy = internals.LlamaBatch(n_tokens=2, embd=width, n_seq_max=1)
         try:
             embedding_data = np.zeros(2 * width, dtype=np.float32)
@@ -1460,9 +1807,7 @@ def test_extended_batch_matches_legacy_decode(completion_model, completion_logit
                     seq_ids=[0], logits_array=[False, True],
                 )
             assert model._ctx.decode(legacy) == 0
-            expected = np.ctypeslib.as_array(
-                model._ctx.get_logits_ith(-1), shape=(model.n_vocab(),)
-            ).copy()
+            expected = _last_logits(model).copy()
         finally:
             legacy.close()
         model.reset()
@@ -1476,14 +1821,12 @@ def test_extended_batch_matches_legacy_decode(completion_model, completion_logit
             assert llama_cpp.llama_batch_ext_set_pos(batch, pos, positions)
             assert llama_cpp.llama_batch_ext_set_output_embd(batch, pos, pos == 1)
         assert llama_cpp.llama_process(model._ctx.ctx, llama_cpp.llama_process_type.LLAMA_PROCESS_TYPE_DECODE, batch) == 0
-        actual = np.ctypeslib.as_array(model._ctx.get_logits_ith(-1), shape=(model.n_vocab(),))
+        actual = _last_logits(model)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
         llama_cpp.llama_batch_ext_clear(batch)
         for idx in range(model.n_batch):
             assert llama_cpp.llama_batch_ext_add_token(batch, 0, tokens[0]) == idx
         assert llama_cpp.llama_batch_ext_add(batch, 0) == -1
-    finally:
-        llama_cpp.llama_batch_ext_free(batch)
 
 
 def test_native_sampler_chain_decode(completion_model):
@@ -1525,17 +1868,12 @@ def test_native_decode_abort_finishes_and_resets_context(
         def __setitem__(self, key, value):
             self.writes.append((key, value))
 
-    def abort_decode(_batch):
-        raise internals.LlamaDecodeAbort("native abort")
-
     cache = RecordingCache()
-    monkeypatch.setattr(completion_model._ctx, "decode", abort_decode)
+    monkeypatch.setattr(completion_model._ctx, "decode", Mock(side_effect=internals.LlamaDecodeAbort("native abort")))
     monkeypatch.setattr(completion_model, "cache", cache)
 
     output = completion_model.create_completion(
-        "Abort this request during prompt evaluation",
-        max_tokens=4,
-        stream=stream,
+        "Abort this request during prompt evaluation", max_tokens=4, stream=stream,
     )
     result = list(output)[-1] if stream else output
 
@@ -1594,55 +1932,24 @@ def test_sampling_constraints_reach_generated_output(completion_model, control):
 
 @pytest.mark.parametrize("model_class,n_seq_max", [(llama_cpp.Llama, 2), (LlamaEmbedding, 1)])
 def test_real_llama_base_embedding_api(llama_cpp_model_path, model_class, n_seq_max):
-    """
-    Test the maintained embedding API on the standard Llama class.
-
-    Covers pre-tokenized batching, normalization, separator-based string
-    batching, token counts, and the OpenAI-compatible response wrapper.
-    """
-    model = model_class(
+    with closing(model_class(
         model_path=llama_cpp_model_path,
         n_gpu_layers=int(os.environ.get("LLAMA_TEST_N_GPU_LAYERS", "0")),
-        embeddings=True,
-        n_ctx=32,
-        n_batch=32,
-        n_ubatch=32,
-        n_seq_max=n_seq_max,
-        kv_unified=True,
-        pooling_type=LLAMA_POOLING_TYPE_NONE,
-        verbose=False,
-    )
-
-    try:
-        token_inputs = [
-            model.tokenize(b"Hello"),
-            model.tokenize(b"world"),
-        ]
-        embeddings, token_count = model.embed(
-            token_inputs,
-            normalize=True,
-            return_count=True,
-        )
-
+        embeddings=True, n_ctx=32, n_batch=32, n_ubatch=32, n_seq_max=n_seq_max,
+        kv_unified=True, pooling_type=LLAMA_POOLING_TYPE_NONE, verbose=False,
+    )) as model:
+        token_inputs = [model.tokenize(text) for text in (b"Hello", b"world")]
+        embeddings, token_count = model.embed(token_inputs, normalize=True, return_count=True)
         assert len(embeddings) == len(token_inputs)
         assert token_count == sum(map(len, token_inputs))
         assert len(embeddings[0]) == len(token_inputs[0])
         assert np.linalg.norm(embeddings[0][0]) == pytest.approx(1.0)
 
-        split_embeddings = model.embed(
-            "Hello\nworld",
-            separator="\n",
-            normalize=False,
-        )
+        split_embeddings = model.embed("Hello\nworld", separator="\n", normalize=False)
         assert len(split_embeddings) == 2
 
-        response = model.create_embedding(
-            ["Hello", "world"],
-            normalize=2,
-        )
+        response = model.create_embedding(["Hello", "world"], normalize=2)
         assert response["object"] == "list"
         assert len(response["data"]) == 2
         assert response["usage"]["prompt_tokens"] > 0
         assert response["usage"]["total_tokens"] == response["usage"]["prompt_tokens"]
-    finally:
-        model.close()

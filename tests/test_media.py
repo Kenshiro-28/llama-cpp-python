@@ -41,11 +41,11 @@ def chat_prefill(make_handler, monkeypatch):
     ctx = SimpleNamespace(
         ctx=object(), memory_seq_rm=Mock(return_value=True),
         memory_seq_add=Mock(), memory_can_shift=lambda: True,
-        memory_clear=Mock(),
+        memory_clear=Mock(), synchronize=Mock(),
     )
     llm = SimpleNamespace(
         n_tokens=3, input_ids=np.array([1, 2, 3, 0, 0, 0]),
-        _n_ctx=6, n_ctx=lambda: 6, n_batch=1, n_keep=0,
+        _n_ctx=6, n_ctx=lambda: 12, n_ctx_seq=lambda: 6, n_batch=1, n_keep=0,
         _ctx=ctx, is_hybrid=False, _hybrid_cache_mgr=None,
         speculative=None, verbose=False,
         context_params=SimpleNamespace(no_perf=True),
@@ -152,7 +152,7 @@ def test_builtin_templates_do_not_duplicate_auto_boundaries(chat_tokenizer, hand
     assert normalized == text.removeprefix("<bos>").removesuffix("<eos>")
 
 
-@pytest.mark.parametrize("failure", ["rollback", "shift", "helper", "position", "position-in-context", "interrupt"])
+@pytest.mark.parametrize("failure", ["rollback", "shift", "helper", "position", "position-in-context", "interrupt", "slots", "video-slots"])
 def test_chat_prefill_failure_resets_state_and_releases_media(chat_prefill, failure):
     handler, llm, backend = chat_prefill
     evaluate = backend.mtmd_helper_eval_chunk_single.side_effect
@@ -166,6 +166,8 @@ def test_chat_prefill_failure_resets_state_and_releases_media(chat_prefill, fail
         )
     elif failure == "helper":
         backend.mtmd_helper_eval_chunk_single.side_effect = lambda *args: -1
+    elif failure in ("slots", "video-slots"):
+        backend.mtmd_helper_eval_chunk_single.side_effect = lambda *args: 1
     elif failure in ("position", "position-in-context"):
         def invalid_position(*args):
             args[-1]._obj.value = 7 if failure == "position" else 3
@@ -175,9 +177,17 @@ def test_chat_prefill_failure_resets_state_and_releases_media(chat_prefill, fail
         backend.mtmd_helper_eval_chunk_single.side_effect = KeyboardInterrupt
 
     match = "expected 4" if failure == "position-in-context" else None
-    with pytest.raises((RuntimeError, ValueError, KeyboardInterrupt), match=match):
-        handler(llama=llm, messages=[])
+    video = failure == "video-slots"
+    messages = [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}] if video else []
+    with pytest.raises((RuntimeError, ValueError, KeyboardInterrupt), match=match) as exc_info:
+        handler(llama=llm, messages=messages)
+    if failure in ("slots", "video-slots"):
+        error = str(exc_info.value)
+        assert all(part in error for part in ("Media evaluation failed", "error code 1", "media_tokens=2", "n_ctx_seq=6"))
+        assert ("video_fps_target" in error) is video
+        assert ("chat_handler_kwargs" in error) is video
     llm.reset.assert_called_once()
+    llm._ctx.synchronize.assert_called_once()
     assert llm.n_tokens == 0 and llm._last_eval_output_count == 0
     assert llm._prefilled_prompt is None and llm._restored_logits is None
     llm._ctx.memory_seq_add.assert_not_called()
@@ -195,23 +205,6 @@ def test_chat_prefill_failure_resets_state_and_releases_media(chat_prefill, fail
     assert llm.create_completion.call_args.kwargs["prompt"] == [-9, -9]
     llm._mark_prefilled_prompt.assert_called_once()
     assert handler._free_mtmd_resources.call_count == 2
-
-
-@pytest.mark.parametrize("video", [False, True])
-def test_mtmd_media_eval_error_explains_video_context_usage(chat_prefill, video):
-    handler, llm, backend = chat_prefill
-    backend.mtmd_helper_eval_chunk_single.side_effect = lambda *args: 1
-    messages = [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}] if video else []
-
-    with pytest.raises(ValueError, match="Media evaluation failed") as exc_info:
-        handler(llama=llm, messages=messages)
-
-    error = str(exc_info.value)
-    assert "error code 1" in error
-    assert "media_tokens=2" in error
-    assert "n_ctx=6" in error
-    assert ("video_fps_target" in error) is video
-    assert ("chat_handler_kwargs" in error) is video
 
 
 @pytest.mark.parametrize("handler_name", [
@@ -570,161 +563,210 @@ def test_chat_prefill_mtp_callback_and_cleanup(chat_prefill, failure):
     handler._free_mtmd_resources.assert_called_once()
 
 
-def test_mtmd_audio_stream_default_params_abi():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    if getattr(module.mtmd_audio_stream_params_default, "__ctypes_optional__", False):
-        pytest.skip("This libmtmd does not provide realtime audio input")
-    params = module.mtmd_audio_stream_params_default()
-    assert ctypes.sizeof(params) == ctypes.sizeof(ctypes.c_int32)
-    assert ctypes.alignment(params) == ctypes.alignment(ctypes.c_int32)
-    assert type(params).step_ms.offset == 0
-    assert params.step_ms == 320
-    module.mtmd_audio_stream_free(None)
+
+@pytest.fixture
+def mtmd():
+    return importlib.import_module("llama_cpp.mtmd_cpp")
 
 
-@pytest.mark.parametrize("name", [
-    "mtmd_audio_stream_get_n_rows", "mtmd_audio_stream_get_n_rows_flushed",
+@pytest.mark.parametrize("name, fields", [
+    ("mtmd_helper_cap", "chat vision audio video audio_stream text_gen audio_gen audio_gen_spk_ref"),
+    ("mtmd_caps", "inp_vision inp_audio gen_audio"),
 ])
-def test_mtmd_audio_stream_row_query_abi(name):
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    query = getattr(module, name)
-    if getattr(query, "__ctypes_optional__", False):
-        with pytest.raises(RuntimeError, match=name):
-            query(None)
-        return
-    assert query.argtypes == [module.mtmd_audio_stream_p_ctypes]
-    assert query.restype is ctypes.c_int64
-    # Native queries require a live model-backed stream; never pass NULL.
+def test_mtmd_boolean_capabilities_abi(mtmd, name, fields):
+    struct_type = getattr(mtmd, name)
+    fields = fields.split()
+    assert ctypes.sizeof(struct_type) == len(fields)
+    assert ctypes.alignment(struct_type) == 1
+    assert struct_type._fields_ == [(field, ctypes.c_bool) for field in fields]
+    assert [getattr(struct_type, field).offset for field in fields] == list(range(len(fields)))
+
+
+@pytest.mark.parametrize("name, expected, free", [
+    ("mtmd_audio_stream_params", dict(step_ms=320, prompt=None, n_prompt=0), "mtmd_audio_stream_free"),
+    ("mtmd_gen_state_params", dict(seed=0xFFFFFFFF), "mtmd_gen_state_free"),
+    ("mtmd_helper_gen_audio_inp", dict(stream=False, seq_id=0, prompt=None, prompt_len=0,
+                                     n_past=0, out_mode=0, speaker_ref=None, lang=None,
+                                     top_k=50, top_p=1.0, seed=0xFFFFFFFF, out_type=1), None),
+])
+def test_mtmd_audio_defaults(mtmd, name, expected, free):
+    default = getattr(mtmd, name + "_default")
+    if getattr(default, "__ctypes_optional__", False):
+        pytest.skip(f"This libmtmd does not provide {name}")
+    params = default()
+    for field, expected_value in expected.items():
+        actual = getattr(params, field)
+        assert (not actual if expected_value is None else actual == expected_value), field
+    if free:
+        getattr(mtmd, free)(None)
+
+
+def test_mtmd_helper_function_signatures(mtmd):
+    native = importlib.import_module("llama_cpp.llama_cpp")
+    ptr = ctypes.POINTER
+    signatures = [
+        ("mtmd_helper_get_capabilities", [native.llama_model_p_ctypes, mtmd.mtmd_context_p_ctypes], mtmd.mtmd_helper_cap),
+        ("mtmd_audio_stream_get_n_rows", [mtmd.mtmd_audio_stream_p_ctypes], ctypes.c_int64),
+        ("mtmd_audio_stream_get_n_rows_flushed", [mtmd.mtmd_audio_stream_p_ctypes], ctypes.c_int64),
+        ("mtmd_audio_stream_is_seq_start", [mtmd.mtmd_audio_stream_p_ctypes], ctypes.c_bool),
+        ("mtmd_helper_gen_audio_next_is_text", [mtmd.mtmd_helper_gen_audio_p_ctypes], ctypes.c_bool),
+        ("mtmd_helper_gen_audio_get_logit_bias", [mtmd.mtmd_helper_gen_audio_p_ctypes,
+                                                ptr(ctypes.c_size_t)], ptr(native.llama_logit_bias)),
+        ("mtmd_helper_audio_stream_get_logit_bias", [mtmd.mtmd_context_p_ctypes, native.llama_model_p_ctypes,
+                                                   ptr(native.llama_logit_bias), ctypes.c_int32], ctypes.c_int32),
+        ("mtmd_gen_state_init", [mtmd.mtmd_context_p_ctypes, mtmd.mtmd_gen_state_params], mtmd.mtmd_gen_state_p_ctypes),
+        ("mtmd_gen_state_reset", [mtmd.mtmd_gen_state_p_ctypes], None),
+        ("mtmd_gen_state_set_ref", [mtmd.mtmd_context_p_ctypes, mtmd.mtmd_gen_state_p_ctypes], ctypes.c_int32),
+        ("mtmd_gen_audio_read_tensor", [mtmd.mtmd_context_p_ctypes, ctypes.c_char_p,
+                                        ptr(ctypes.c_float), ctypes.c_size_t], ctypes.c_size_t),
+        ("mtmd_gen_state_free", [mtmd.mtmd_gen_state_p_ctypes], None),
+        ("mtmd_gen_audio_process", [mtmd.mtmd_context_p_ctypes, mtmd.mtmd_gen_state_p_ctypes,
+                                    ptr(mtmd.mtmd_gen_inp), ptr(mtmd.mtmd_gen_out)], ctypes.c_int32),
+        ("mtmd_helper_gen_audio_inp_default", [], mtmd.mtmd_helper_gen_audio_inp),
+        ("mtmd_helper_gen_audio_flush", [mtmd.mtmd_helper_gen_audio_p_ctypes], ctypes.c_int32),
+        ("mtmd_get_video_config", [mtmd.mtmd_context_p_ctypes, ctypes.c_int32, ctypes.c_int32,
+                                   ctypes.c_int32, ctypes.c_float], mtmd.mtmd_video_config),
+        ("mtmd_bitmap_set_is_video", [mtmd.mtmd_bitmap_p_ctypes, ctypes.c_bool], None),
+        ("mtmd_bitmap_is_voice", [mtmd.mtmd_bitmap_p_ctypes], ctypes.c_bool),
+        ("mtmd_gen_audio_voice_name", [mtmd.mtmd_context_p_ctypes, ctypes.c_int32], ctypes.c_char_p),
+        ("mtmd_gen_audio_get_voice", [mtmd.mtmd_context_p_ctypes, ctypes.c_char_p], mtmd.mtmd_bitmap_p_ctypes),
+        ("mtmd_helper_bitmap_init_from_file", [mtmd.mtmd_context_p_ctypes, ctypes.c_char_p,
+                                              ctypes.c_bool, mtmd.mtmd_helper_init_opt], mtmd.mtmd_helper_bitmap_wrapper),
+        ("mtmd_helper_bitmap_init_from_buf", [mtmd.mtmd_context_p_ctypes, ptr(ctypes.c_uint8),
+                                             ctypes.c_size_t, ctypes.c_bool, mtmd.mtmd_helper_init_opt], mtmd.mtmd_helper_bitmap_wrapper),
+    ]
+    for name, args, result in signatures:
+        function = getattr(mtmd, name)
+        if getattr(function, "__ctypes_optional__", False):
+            with pytest.raises(RuntimeError, match=name):
+                function(*([None] * len(args)))
+        else:
+            # Only unavailable stubs may receive NULL; live queries need real contexts.
+            assert function.argtypes == args, name
+            assert function.restype is result, name
+    assert mtmd.mtmd_gen_inp_default.restype is mtmd.mtmd_gen_inp
+    assert mtmd.mtmd_get_cap_from_file.restype is mtmd.mtmd_caps
+    assert mtmd.mtmd_helper_video_init.restype is mtmd.mtmd_helper_video_p_ctypes
 
 
 @pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="64-bit MTMD ABI")
-@pytest.mark.parametrize("name, offsets", [
-    ("mtmd_gen_inp", {
-        "type": 0, "code0": 4, "embd": 8, "top_k": 16, "top_p": 20,
-        "temp": 24, "codes": 32, "n_codes": 40, "feats": 48, "n_feats": 56,
+@pytest.mark.parametrize("name, size, offsets", [
+    ("clip_context_params", 72, {
+        "use_gpu": 0, "device": 8, "flash_attn_type": 16, "image_min_tokens": 20,
+        "image_max_tokens": 24, "warmup": 28, "cb_eval": 32, "cb_eval_user_data": 40,
+        "no_alloc": 48, "progress_callback": 56, "progress_callback_user_data": 64,
     }),
-    ("mtmd_gen_out", {
+    ("mtmd_gen_inp", 72, {
+        "type": 0, "code0": 4, "embd": 8, "top_k": 16, "top_p": 20,
+        "temp": 24, "penalty_repeat": 28, "penalty_last_n": 32,
+        "codes": 40, "n_codes": 48, "feats": 56, "n_feats": 64,
+    }),
+    ("mtmd_gen_out", 64, {
         "codes": 0, "n_codes": 8, "feats": 16, "n_feats": 24,
         "embd": 32, "is_eos": 40, "audio": 48, "n_samples": 56,
     }),
+    ("mtmd_audio_stream_params", 24, {"step_ms": 0, "prompt": 8, "n_prompt": 16}),
+    ("mtmd_gen_state_params", 4, {"seed": 0}),
+    ("mtmd_video_config", 20, {"tmpl": 0, "fps": 4, "n_frames": 8, "frame_width": 12, "frame_height": 16}),
+    ("mtmd_helper_video_init_params", 32, {"fps_target": 0, "ffmpeg_bin_dir": 8,
+                                         "timestamp_interval_ms": 16, "no_soundtrack": 24}),
+    ("mtmd_helper_init_opt", 32, {"video_params": 0}),
+    ("mtmd_gen_audio_info", 24, {"type": 0, "sample_rate": 4, "model_variant": 8, "n_voices": 16}),
+    ("mtmd_helper_gen_audio_inp", 64, {
+        "stream": 0, "seq_id": 4, "prompt": 8, "prompt_len": 16,
+        "n_past": 24, "out_mode": 28, "speaker_ref": 32, "lang": 40,
+        "top_k": 48, "top_p": 52, "seed": 56, "out_type": 60,
+    }),
 ])
-def test_mtmd_gen_struct_abi(name, offsets):
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    struct_type = getattr(module, name)
-    # seed moved into state params; serialized decoder state is no longer public.
-    assert ctypes.sizeof(struct_type) == 64
-    assert ctypes.alignment(struct_type) == 8
+def test_mtmd_audio_struct_abi(mtmd, name, size, offsets):
+    struct_type = getattr(mtmd, name)
+    assert ctypes.sizeof(struct_type) == size
+    assert ctypes.alignment(struct_type) == (4 if size in (4, 20) else 8)
     assert {field: getattr(struct_type, field).offset for field, _ in struct_type._fields_} == offsets
+    if name == "mtmd_helper_gen_audio_inp":
+        value = struct_type(stream=False, seq_id=7)
+        assert bytes(value)[0] == 0 and ctypes.c_int32.from_buffer_copy(bytes(value)[4:8]).value == 7
+        value.stream = True
+        assert value.seq_id == 7
 
 
-def test_mtmd_gen_state_api():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    params = module.mtmd_gen_state_params_default()
-    assert ctypes.sizeof(params) == ctypes.sizeof(ctypes.c_uint32)
-    assert ctypes.alignment(params) == ctypes.alignment(ctypes.c_uint32)
-    assert type(params).seed.offset == 0
-    assert params.seed == 0xFFFFFFFF
-    assert module.mtmd_gen_state_init.argtypes == [
-        module.mtmd_context_p_ctypes, module.mtmd_gen_state_params,
-    ]
-    assert module.mtmd_gen_state_init.restype is module.mtmd_gen_state_p_ctypes
-    for function in (module.mtmd_gen_state_reset, module.mtmd_gen_state_free):
-        assert function.argtypes == [module.mtmd_gen_state_p_ctypes]
-        assert function.restype is None
-    assert module.mtmd_gen_inp_default.restype is module.mtmd_gen_inp
-    assert module.mtmd_gen_audio_process.argtypes == [
-        module.mtmd_context_p_ctypes, module.mtmd_gen_state_p_ctypes,
-        ctypes.POINTER(module.mtmd_gen_inp), ctypes.POINTER(module.mtmd_gen_out),
-    ]
-    assert module.mtmd_gen_audio_process.restype is ctypes.c_int32
-    module.mtmd_gen_state_free(None)
+
+@pytest.mark.parametrize("name, values", [
+    ("mtmd_gen_audio_type", [0, 1, 2, 3, 4, 5, 6]),
+    ("mtmd_helper_gen_audio_out_mode", [0, 1, 2, 3]),
+    ("mtmd_helper_gen_audio_outtype", [0, 1]),
+    ("mtmd_video_template", [0, 1, 2, 3]),
+])
+def test_mtmd_enums(mtmd, name, values):
+    assert list(map(int, getattr(mtmd, name))) == values
 
 
-def test_mtmd_caps_abi():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    caps = module.mtmd_caps
-    assert ctypes.sizeof(caps) == 3
-    assert ctypes.alignment(caps) == 1
-    assert [getattr(caps, field).offset for field in ("inp_vision", "inp_audio", "gen_audio")] == [0, 1, 2]
-    assert module.mtmd_get_cap_from_file.restype is caps
-
-
-def test_mtmd_helper_gen_audio_input_abi():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    inp = module.mtmd_helper_gen_audio_inp
-    assert inp.stream.offset == 0
-    assert inp.seq_id.offset == 4
-    assert inp.prompt.offset == 8
-    pointer_size = ctypes.sizeof(ctypes.c_void_p)
-    assert ctypes.sizeof(inp) == 24 + 4 * pointer_size
-    assert {field: getattr(inp, field).offset for field in
-            ("prompt_len", "speaker_ref", "lang", "top_k", "top_p", "seed", "out_type")} == {
-        "prompt_len": 8 + pointer_size, "speaker_ref": 8 + 2 * pointer_size,
-        "lang": 8 + 3 * pointer_size, "top_k": 8 + 4 * pointer_size,
-        "top_p": 12 + 4 * pointer_size, "seed": 16 + 4 * pointer_size,
-        "out_type": 20 + 4 * pointer_size,
-    }
-    value = inp(stream=False, seq_id=7)
-    raw = bytes(value)
-    assert raw[0] == 0
-    assert ctypes.c_int32.from_buffer_copy(raw[4:8]).value == 7
-    value.stream = True
-    assert value.seq_id == 7
-
-
-def test_mtmd_helper_gen_audio_defaults_and_flush_api():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    default = module.mtmd_helper_gen_audio_inp_default
-    assert default.argtypes == []
-    assert default.restype is module.mtmd_helper_gen_audio_inp
-    inp = default()
-    assert not inp.stream and inp.seq_id == 0
-    assert inp.prompt is None and inp.prompt_len == 0
-    assert inp.speaker_ref is None and inp.lang is None
-    assert inp.top_k == 50 and inp.top_p == 1.0
-    assert inp.seed == 0xFFFFFFFF
-    assert inp.out_type == module.mtmd_helper_gen_audio_outtype.MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV
-    assert module.mtmd_helper_gen_audio_flush.argtypes == [module.mtmd_helper_gen_audio_p_ctypes]
-    assert module.mtmd_helper_gen_audio_flush.restype is ctypes.c_int32
-
-
-def test_mtmd_decoder_pos_abi():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
-    position = module.mtmd_decoder_pos
+def test_mtmd_decoder_pos_abi(mtmd):
+    position = mtmd.mtmd_decoder_pos
     assert ctypes.sizeof(position) == 16
     assert ctypes.alignment(position) == ctypes.alignment(ctypes.c_uint32)
     assert [getattr(position, field).offset for field in ("t", "x", "y", "z")] == [0, 4, 8, 12]
 
     # Exercise native struct returns and array writes without loading a model.
-    chunks = module.mtmd_test_create_input_chunks()
+    chunks = mtmd.mtmd_test_create_input_chunks()
     assert chunks
     try:
-        chunk = module.mtmd_input_chunks_get(chunks, 1)
-        image = module.mtmd_input_chunk_get_tokens_image(chunk)
+        chunk = mtmd.mtmd_input_chunks_get(chunks, 1)
+        image = mtmd.mtmd_input_chunk_get_tokens_image(chunk)
         assert image
-        count = module.mtmd_image_tokens_get_n_tokens(image)
+        count = mtmd.mtmd_image_tokens_get_n_tokens(image)
         assert count > 1
         positions = (position * count)()
-        module.mtmd_helper_image_get_decoder_pos(image, 7, positions)
+        mtmd.mtmd_helper_image_get_decoder_pos(image, 7, positions)
         for index, actual in enumerate(positions):
-            returned = module.mtmd_image_tokens_get_decoder_pos(image, 7, index)
+            returned = mtmd.mtmd_image_tokens_get_decoder_pos(image, 7, index)
             expected = (7 + index,) * 4
             assert (actual.t, actual.x, actual.y, actual.z) == expected
             assert (returned.t, returned.x, returned.y, returned.z) == expected
     finally:
-        module.mtmd_input_chunks_free(chunks)
+        mtmd.mtmd_input_chunks_free(chunks)
+
+
+def test_mtmd_chunk_serialization_writable_buffer(mtmd):
+    chunks = mtmd.mtmd_test_create_input_chunks()
+    assert chunks
+    try:
+        for index in range(mtmd.mtmd_input_chunks_size(chunks)):
+            chunk = mtmd.mtmd_input_chunks_get(chunks, index)
+            size = ctypes.c_size_t()
+            assert mtmd.mtmd_input_chunk_save(chunk, None, 0, ctypes.byref(size)) == 0
+            assert size.value > 0
+            # A sentinel also verifies that native serialization respects out_len.
+            output = (ctypes.c_uint8 * (size.value + 1))()
+            output[-1] = 0xA5
+            assert mtmd.mtmd_input_chunk_save(chunk, output, size.value - 1, ctypes.byref(size)) != 0
+            assert not any(output[:-1])
+            with pytest.raises(ctypes.ArgumentError):
+                mtmd.mtmd_input_chunk_save(chunk, b"\0" * size.value, size.value, ctypes.byref(size))
+            assert mtmd.mtmd_input_chunk_save(chunk, output, size.value, ctypes.byref(size)) == 0
+            assert output[-1] == 0xA5
+            restored = mtmd.mtmd_input_chunk_load(bytes(output[:-1]), size.value)
+            assert restored
+            try:
+                for name in ("type", "n_tokens", "n_pos", "id"):
+                    query = getattr(mtmd, "mtmd_input_chunk_get_" + name)
+                    assert query(restored) == query(chunk)
+            finally:
+                mtmd.mtmd_input_chunk_free(restored)
+    finally:
+        mtmd.mtmd_input_chunks_free(chunks)
+
 
 
 @pytest.mark.parametrize("n_pos", [1, 4])
-def test_mtmd_helper_post_decode_callback(n_pos):
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
+def test_mtmd_helper_post_decode_callback(mtmd, n_pos):
     embeddings = (ctypes.c_float * 6)(1, 2, 3, 4, 5, 6)
     positions = (ctypes.c_int32 * (2 * n_pos))(*range(2 * n_pos))
-    batch = module.mtmd_helper_embd_batch(2, embeddings, 3, positions, n_pos, 7)
+    batch = mtmd.mtmd_helper_embd_batch(2, embeddings, 3, positions, n_pos, 7)
     user_data = ctypes.c_int32(11)
     received = []
 
-    @module.mtmd_helper_post_decode_callback
+    @mtmd.mtmd_helper_post_decode_callback
     def callback(batch_ptr, user_data_ptr):
         received.append((
             ctypes.addressof(batch_ptr.contents),
@@ -743,43 +785,33 @@ def test_mtmd_helper_post_decode_callback(n_pos):
         ctypes.addressof(batch), 2, 3, n_pos, 7,
         [1, 2, 3, 4, 5, 6], list(range(2 * n_pos)), 11,
     )]
-    assert module.mtmd_helper_decode_image_chunk.argtypes[8] is module.mtmd_helper_post_decode_callback
+    assert mtmd.mtmd_helper_decode_image_chunk.argtypes[8] is mtmd.mtmd_helper_post_decode_callback
 
 
-def test_mtmd_helper_init_opt_abi():
-    module = importlib.import_module("llama_cpp.mtmd_cpp")
 
-    assert module.mtmd_helper_video_init_params._fields_ == [
+def test_mtmd_helper_init_opt_abi(mtmd):
+
+    assert mtmd.mtmd_helper_video_init_params._fields_ == [
         ("fps_target", ctypes.c_float),
         ("ffmpeg_bin_dir", ctypes.c_char_p),
         ("timestamp_interval_ms", ctypes.c_int64),
+        ("no_soundtrack", ctypes.c_bool),
     ]
-    assert module.mtmd_helper_init_opt._fields_ == [
-        ("video_params", module.mtmd_helper_video_init_params),
+    assert mtmd.mtmd_helper_init_opt._fields_ == [
+        ("video_params", mtmd.mtmd_helper_video_init_params),
     ]
-    assert module.mtmd_helper_bitmap_init_from_file.argtypes == [
-        module.mtmd_context_p_ctypes,
-        ctypes.c_char_p,
-        ctypes.c_bool,
-        module.mtmd_helper_init_opt,
-    ]
-    assert module.mtmd_helper_bitmap_init_from_buf.argtypes == [
-        module.mtmd_context_p_ctypes,
-        ctypes.POINTER(ctypes.c_uint8),
-        ctypes.c_size_t,
-        ctypes.c_bool,
-        module.mtmd_helper_init_opt,
-    ]
-    assert module.mtmd_helper_video_init.restype is module.mtmd_helper_video_p_ctypes
-
-    opt = module.mtmd_helper_init_opt_default()
+    opt = mtmd.mtmd_helper_init_opt_default()
     assert opt.video_params.fps_target == 4.0
     assert opt.video_params.ffmpeg_bin_dir is None
     assert opt.video_params.timestamp_interval_ms == 5000
+    assert not opt.video_params.no_soundtrack
+    assert not mtmd.mtmd_helper_video_init_params_default().no_soundtrack
+
 
 
 @pytest.mark.parametrize("handler_name", ["MTMDBaseHandler", "MTMDChatHandler"])
-def test_mtmd_chat_handler_video_options(tmp_path, make_handler, handler_name):
+@pytest.mark.parametrize("no_soundtrack", [None, False, True])
+def test_mtmd_chat_handler_video_options(tmp_path, make_handler, handler_name, no_soundtrack):
     module = importlib.import_module("llama_cpp.mtmd_cpp")
 
     executable_suffix = ".exe" if os.name == "nt" else ""
@@ -793,22 +825,24 @@ def test_mtmd_chat_handler_video_options(tmp_path, make_handler, handler_name):
         video_fps_target=2.5,
         video_ffmpeg_bin_dir=tmp_path,
         video_timestamp_interval_ms=10000,
+        video_no_soundtrack=no_soundtrack,
     )
     video_params = handler._mtmd_helper_init_opt.video_params
     assert video_params.fps_target == 2.5
     assert video_params.ffmpeg_bin_dir == os.fsencode(os.path.abspath(tmp_path))
     assert video_params.timestamp_interval_ms == 10000
+    assert video_params.no_soundtrack is bool(no_soundtrack)
 
     opt = module.mtmd_helper_init_opt_default()
     handler = make_handler(handler_name, mtmd_helper_init_opt=opt)
     assert handler._mtmd_helper_init_opt is opt
 
-    with pytest.raises(ValueError, match="cannot be combined"):
-        make_handler(
-            handler_name,
-            mtmd_helper_init_opt=opt,
-            video_fps_target=1.0,
-        )
+    for options in ({"video_fps_target": 1.0}, {"video_no_soundtrack": False}):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            make_handler(handler_name, mtmd_helper_init_opt=opt, **options)
+    with pytest.raises(TypeError, match="video_no_soundtrack"):
+        make_handler(handler_name, video_no_soundtrack="false")
+
 
 
 def test_mtmd_chat_handler_rejects_invalid_ffmpeg_bin_dir(tmp_path, make_handler):
@@ -821,15 +855,24 @@ def test_mtmd_chat_handler_rejects_invalid_ffmpeg_bin_dir(tmp_path, make_handler
 
 @pytest.mark.parametrize("handler_name", ["MTMDBaseHandler", "MTMDChatHandler"])
 @pytest.mark.parametrize("flash_attn, expected_flash", [(None, -1), (False, 0), (True, 1)])
-def test_mtmd_context_initialization_and_close(tmp_path, handler_name, flash_attn, expected_flash):
+@pytest.mark.parametrize("api", ["native", "legacy", "legacy-no-stream"])
+def test_mtmd_context_initialization_and_close(tmp_path, handler_name, flash_attn, expected_flash, api, monkeypatch):
     multimodal = importlib.import_module("llama_cpp.llama_multimodal")
+    monkeypatch.setattr(multimodal.llama_cpp_lib, "llama_model_n_tokens_delay", lambda model: 0)
     handler = getattr(multimodal, handler_name)(
         clip_model_path=str(tmp_path), verbose=False, use_gpu=False,
         image_min_tokens=32, image_max_tokens=128, batch_max_tokens=256,
         flash_attn=flash_attn,
     )
     native = handler._mtmd_cpp
+    cap = native.mtmd_helper_cap(chat=True, vision=True, video=True, text_gen=True, audio_stream=True)
     backend = SimpleNamespace(
+        mtmd_helper_cap=native.mtmd_helper_cap,
+        mtmd_gen_audio_type=native.mtmd_gen_audio_type,
+        mtmd_helper_get_capabilities=Mock(return_value=cap),
+        mtmd_helper_model_can_chat=Mock(return_value=True),
+        mtmd_support_audio_stream=Mock(return_value=True),
+        mtmd_gen_audio_get_info=Mock(return_value=SimpleNamespace(type=0)),
         mtmd_context_params_default=native.mtmd_context_params_default,
         clip_flash_attn_type=native.clip_flash_attn_type,
         mtmd_helper_log_set=Mock(),
@@ -841,8 +884,14 @@ def test_mtmd_context_initialization_and_close(tmp_path, handler_name, flash_att
         mtmd_helper_support_video=Mock(return_value=True),
         mtmd_free=Mock(),
     )
+    if api != "native":
+        backend.mtmd_helper_get_capabilities.__ctypes_optional__ = True
+        backend.mtmd_helper_get_capabilities.side_effect = RuntimeError("unavailable")
+    if api == "legacy-no-stream":
+        backend.mtmd_support_audio_stream.__ctypes_optional__ = True
+        backend.mtmd_support_audio_stream.side_effect = RuntimeError("unavailable")
     handler._mtmd_cpp = backend
-    model = SimpleNamespace(model=456, n_threads=2)
+    model = SimpleNamespace(model=456, _ctx=SimpleNamespace(ctx=789), n_threads=2)
     if handler_name == "MTMDChatHandler":
         model.token_eos = lambda: 2
         model.token_bos = lambda: 1
@@ -856,6 +905,18 @@ def test_mtmd_context_initialization_and_close(tmp_path, handler_name, flash_att
         assert handler.is_support_vision
         assert not handler.is_support_audio
         assert handler.is_support_video
+        assert handler.capabilities.chat and handler.capabilities.text_gen
+        assert not handler.capabilities.audio_gen and not handler.capabilities.audio_gen_spk_ref
+        assert handler.capabilities.audio_stream == (api != "legacy-no-stream")
+        if api == "native":
+            backend.mtmd_helper_get_capabilities.assert_called_once_with(456, 123)
+            backend.mtmd_support_vision.assert_not_called()
+            backend.mtmd_support_audio.assert_not_called()
+            backend.mtmd_helper_support_video.assert_not_called()
+            backend.mtmd_helper_model_can_chat.assert_not_called()
+        else:
+            backend.mtmd_helper_get_capabilities.assert_not_called()
+            backend.mtmd_helper_model_can_chat.assert_called_once_with(789, 123)
         assert handler.mctx_params.n_threads == 2
         assert not handler.mctx_params.use_gpu
         assert handler.mctx_params.image_min_tokens == 32
@@ -872,6 +933,7 @@ def test_mtmd_context_initialization_and_close(tmp_path, handler_name, flash_att
         handler.close()
         handler.close()
     backend.mtmd_free.assert_called_once_with(123)
+    assert handler.capabilities is None
 
 
 def test_mtmd_base_close_releases_context_after_callback_failure(tmp_path):
@@ -891,6 +953,33 @@ def test_mtmd_base_close_releases_context_after_callback_failure(tmp_path):
     handler.close()
     assert events == ["child", "context"]
     assert handler.mtmd_ctx is None
+
+
+@pytest.mark.parametrize("kind, template, delay, expected", [
+    (1, None, 0, (False, False)), (2, b"", 0, (True, True)),
+    (0, None, 2, (True, False)), (4, b"chat", 0, (True, True)),
+    (0, None, None, (True, True)),
+])
+def test_mtmd_legacy_capabilities_match_text_and_delay_semantics(make_handler, monkeypatch, mtmd, kind, template, delay, expected):
+    from llama_cpp import llama_cpp as native
+
+    handler = make_handler("MTMDBaseHandler")
+    handler._mtmd_cpp = SimpleNamespace(
+        mtmd_helper_cap=mtmd.mtmd_helper_cap, mtmd_gen_audio_type=mtmd.mtmd_gen_audio_type,
+        mtmd_gen_audio_get_info=lambda ctx: SimpleNamespace(type=kind),
+        mtmd_helper_model_can_chat=lambda *args: True,
+        mtmd_support_vision=lambda ctx: False, mtmd_support_audio=lambda ctx: True,
+        mtmd_helper_support_video=lambda ctx: False,
+    )
+    monkeypatch.setattr(native, "llama_model_chat_template", lambda *args: template)
+    query = Mock(return_value=delay)
+    if delay is None:
+        query.__ctypes_optional__ = True
+        query.side_effect = RuntimeError("unavailable")
+    monkeypatch.setattr(native, "llama_model_n_tokens_delay", query)
+    cap = handler._query_capabilities(SimpleNamespace(model=456, _ctx=SimpleNamespace(ctx=789)))
+    assert (cap.text_gen, cap.chat) == expected
+    assert cap.audio_gen == (kind != 0) and cap.audio_gen_spk_ref == (kind in (1, 2))
 
 
 def test_mtmd_chat_constructor_preserves_template_options(tmp_path):
@@ -982,8 +1071,8 @@ def test_qwen_templates_inject_media_marker(make_handler, kind, handler_name, pa
             )
 
 
-@pytest.mark.parametrize("placeholder", ["<|image_pad|>", "<|video_pad|>", "/path/to/media"])
-@pytest.mark.parametrize("architecture", ["qwen35", "qwen3vl", "gemma4", ""])
+@pytest.mark.parametrize("placeholder", ["<|image_pad|>", "<|video_pad|>", "<|video|>", "/path/to/media"])
+@pytest.mark.parametrize("architecture", ["qwen35", "qwen3vl", "lfm3", "gemma4", ""])
 def test_generic_media_normalization_preserves_template_boundaries(make_handler, placeholder, architecture):
     template = "literal <|vision_start|>text<|vision_end|> <|vision_start|>\n" + placeholder + " <|vision_end|>"
     handler = make_handler(
@@ -994,8 +1083,9 @@ def test_generic_media_normalization_preserves_template_boundaries(make_handler,
     prompt = handler._replace_media_placeholders(
         handler.chat_template.render(), [{"url": "/path/to/media", "type": "image"}],
     )
-    expected = "<__media__>" if architecture.startswith("qwen") else "<|vision_start|>\n<__media__> <|vision_end|>"
+    expected = "<__media__>" if architecture.startswith("qwen") or architecture == "lfm3" else "<|vision_start|>\n<__media__> <|vision_end|>"
     assert prompt == "literal <|vision_start|>text<|vision_end|> " + expected
+    assert handler._qwen_vision_template == architecture.startswith("qwen")
 
 
 @pytest.fixture
@@ -1031,18 +1121,21 @@ def chunk_ledger(tmp_path, make_handler, monkeypatch):
     return handler, ledger
 
 
-@pytest.mark.parametrize("source", ["video", "audio"])
-def test_media_chunk_identity_survives_expansion_before_image(chunk_ledger, source):
+
+@pytest.mark.parametrize("source, soundtrack", [("video", False), ("video", True), ("audio", False)])
+def test_media_chunk_identity_survives_expansion_before_image(chunk_ledger, source, soundtrack):
     _, ledger = chunk_ledger
     kind = 1 if source == "video" else 2
     media = [{"type": source, source: "first.media"}, {"type": "image_url", "image_url": "last.png"}]
     identities = [(kind, b"first+0"), (kind, b"first+2"), (1, b"last-image")]
+    if soundtrack:
+        identities.insert(1, (2, b"first+audio0"))
     first = ledger(identities, media)
-    assert len(set(first)) == 3
+    assert len(set(first)) == len(identities)
     assert ledger(identities, media) == first
-    changed = ledger([(kind, b"changed+0"), (kind, b"changed+2"), (1, b"last-image")], media)
-    assert changed[:2] != first[:2]
-    assert changed[2] == first[2]
+    changed = ledger([(k, identity.replace(b"first", b"changed")) for k, identity in identities], media)
+    assert changed[:-1] != first[:-1]
+    assert changed[-1] == first[-1]
 
 
 def test_media_chunk_identity_uses_content_and_subchunk_not_url(chunk_ledger):
@@ -1057,11 +1150,12 @@ def test_media_chunk_identity_uses_content_and_subchunk_not_url(chunk_ledger):
     assert ledger([(1, b"")], media) != ledger([(1, b"")], media)
 
 
-def test_media_chunk_identity_includes_video_sampling(chunk_ledger):
+@pytest.mark.parametrize("field, value", [("fps_target", 0.5), ("timestamp_interval_ms", 1000), ("no_soundtrack", True)])
+def test_media_chunk_identity_includes_video_sampling(chunk_ledger, field, value):
     handler, ledger = chunk_ledger
     media = [{"type": "video", "video": "same.mp4"}]
     first = ledger([(1, b"video+0")], media)
-    handler._mtmd_helper_init_opt.video_params.fps_target = 0.5
+    setattr(handler._mtmd_helper_init_opt.video_params, field, value)
     assert ledger([(1, b"video+0")], media) != first
 
 
@@ -1129,12 +1223,14 @@ def audio_pipeline(tmp_path, monkeypatch):
     hidden = (ctypes.c_float * 2)(1, 2)
     output = ctypes.create_string_buffer(struct.pack("4f", 0.0, 0.1, -0.1, 0.0))
     import io, wave
-    state = SimpleNamespace(kind=1, steps=0, fail=None, prompts=[], tokens=[], stop_at=3)
+    state = SimpleNamespace(kind=1, steps=0, fail=None, prompts=[], tokens=[], stop_at=3,
+                            voices=0, multilingual=False)
 
     def set_input(ctx, ptr):
         inp = ctypes.cast(ptr, ctypes.POINTER(native.mtmd_helper_gen_audio_inp)).contents
         assert inp.stream is False and inp.seq_id == 0
         state.prompts.append((ctypes.string_at(inp.prompt, inp.prompt_len), inp.seed))
+        state.speaker = inp.speaker_ref
         state.steps = 0
         state.out_type = inp.out_type
         return 1 if state.fail == "set_input" else 0
@@ -1152,7 +1248,7 @@ def audio_pipeline(tmp_path, monkeypatch):
         return 0
 
     def get_output(ctx, rate, data, size, samples):
-        sample_rate = 32000 if state.kind == 3 else 24000
+        sample_rate = {3: 32000, 6: 44100}.get(state.kind, 24000)
         ctypes.cast(rate, ctypes.POINTER(ctypes.c_int32))[0] = sample_rate
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, "wb") as wav:
@@ -1169,7 +1265,9 @@ def audio_pipeline(tmp_path, monkeypatch):
         mtmd_gen_audio_type=native.mtmd_gen_audio_type,
         mtmd_helper_gen_audio_outtype=native.mtmd_helper_gen_audio_outtype,
         mtmd_helper_gen_audio_inp=native.mtmd_helper_gen_audio_inp,
-        mtmd_gen_audio_get_info=lambda ctx: SimpleNamespace(type=state.kind),
+        mtmd_gen_audio_get_info=lambda ctx: SimpleNamespace(type=state.kind, n_voices=state.voices),
+        mtmd_gen_audio_voice_name=Mock(return_value=b"default"),
+        mtmd_gen_audio_read_tensor=lambda *args: int(state.multilingual),
         mtmd_helper_gen_audio_init=Mock(return_value=456),
         mtmd_helper_gen_audio_free=Mock(), mtmd_helper_gen_audio_reset=Mock(),
         mtmd_helper_gen_audio_set_input=set_input,
@@ -1177,6 +1275,7 @@ def audio_pipeline(tmp_path, monkeypatch):
         mtmd_helper_gen_audio_step_gen=step_gen,
         mtmd_helper_gen_audio_get_output=get_output,
         mtmd_bitmap_is_audio=lambda bitmap: True,
+        mtmd_gen_audio_get_voice=Mock(side_effect=lambda ctx, name: 987 if name in (b"alba", b"default") else None),
         mtmd_bitmap_free=Mock(), mtmd_helper_video_free=Mock(), mtmd_free=Mock(),
     )
     generator._mtmd_cpp = backend
@@ -1189,8 +1288,9 @@ def audio_pipeline(tmp_path, monkeypatch):
     sampler_factory = Mock(return_value=sampler)
     monkeypatch.setattr(generator, "_create_audio_sampler", sampler_factory)
     llama = SimpleNamespace(
-        _ctx=SimpleNamespace(ctx=321, pooling_type=lambda: 0, n_batch=lambda: 64),
-        context_params=SimpleNamespace(embeddings=True),
+        _model=SimpleNamespace(classifier_free_guidance=Mock(return_value=True)),
+        _ctx=SimpleNamespace(ctx=321, pooling_type=lambda: 0, n_batch=lambda: 64, n_seq_max=lambda: 2),
+        context_params=SimpleNamespace(embeddings=True, kv_unified=True),
         _abort_event=threading.Event(), _native_abort_flag=ctypes.c_bool(False),
         reset=Mock(),
     )
@@ -1198,10 +1298,11 @@ def audio_pipeline(tmp_path, monkeypatch):
     generator.close()
 
 
-@pytest.mark.parametrize("kind", [1, 3], ids=["qwen", "soprano"])
+@pytest.mark.parametrize("kind", [1, 3, 5], ids=["qwen", "soprano", "chatterbox"])
 def test_tts_sampled_models_repeated_requests_copy_binary_output(audio_pipeline, kind):
     generator, llama, backend, state, factory, output = audio_pipeline
     state.kind = kind
+    state.voices = int(kind == 5)
     generator.is_support_audio = kind != 3
     text = "Hello" if kind == 3 else "你好"
     expected = output.raw[:-1]
@@ -1219,21 +1320,28 @@ def test_tts_sampled_models_repeated_requests_copy_binary_output(audio_pipeline,
     assert factory.return_value.accept.call_count == 6
     assert factory.return_value.close.call_count == 2
     assert backend.mtmd_helper_gen_audio_reset.call_count == 2
+    llama._model.classifier_free_guidance.assert_not_called()
     backend.mtmd_helper_gen_audio_init.assert_called_once()
     generator.close()
     backend.mtmd_helper_gen_audio_free.assert_called_once_with(456)
 
 
-def test_tts_pocket_skips_sampler_and_limits_steps(audio_pipeline):
+@pytest.mark.parametrize("kind, frames", [(2, 1), (3, 2), (6, 1)], ids=["pocket", "soprano", "drama3"])
+def test_tts_model_specific_frame_limits(audio_pipeline, kind, frames):
     generator, llama, backend, state, factory, _ = audio_pipeline
-    state.kind = 2
-    result = generator.create_speech(
-        llama=llama, text="hello", speaker_reference=b"RIFF0000WAVE", max_frames=1,
-    )
+    state.kind = kind
+    options = {"speaker_reference": b"RIFF0000WAVE"} if kind == 2 else {}
+    result = generator.create_speech(llama=llama, text="hello", max_frames=frames, **options)
     assert result.finish_reason == "length"
-    assert state.tokens == [-1]
-    factory.assert_not_called()
-    backend.mtmd_bitmap_free.assert_called_once_with(789)
+    llama._model.classifier_free_guidance.assert_not_called()
+    assert result.sample_rate == {2: 24000, 3: 32000, 6: 44100}[kind]
+    assert state.tokens == ([42, 42] if kind == 3 else [-1])
+    if kind != 3:
+        factory.assert_not_called()
+        if kind == 2:
+            backend.mtmd_bitmap_free.assert_called_once_with(789)
+    else:
+        factory.assert_called_once()
 
 
 @pytest.mark.parametrize("stage", [
@@ -1264,36 +1372,96 @@ def test_tts_failure_can_be_followed_by_success(audio_pipeline, monkeypatch, sta
     assert generator.create_speech(llama=llama, text="hello", response_format=response_format).finish_reason == "stop"
 
 
-def test_tts_soprano_constraints_and_frame_limit(audio_pipeline):
+def test_tts_validates_model_and_request_before_decode(audio_pipeline):
     generator, llama, backend, state, factory, _ = audio_pipeline
-    state.kind = 3
-    for options, message in [
-        ({"speaker_reference": "missing.wav"}, "speaker_reference"),
-        ({"language": "en"}, "omit language"),
-        ({"max_frames": 1}, "max_frames >= 2"),
-    ]:
+    cases = [
+        (1, {"text": " "}, None), (1, {"max_frames": 0}, None),
+        (1, {"seed": -1}, None), (1, {"response_format": "mp3"}, None),
+        (0, {}, "supported TTS"), (2, {}, "requires speaker_reference"),
+        (3, {"speaker_reference": "missing.wav"}, "speaker_reference"),
+        (3, {"language": "en"}, "omit language"),
+        (3, {"max_frames": 1}, "max_frames >= 2"),
+        (6, {"speaker_reference": "missing.wav"}, "speaker_reference"),
+        (6, {"language": "en"}, "omit language"),
+        (6, {"voice": "default"}, "speaker tags"),
+    ]
+    for kind, options, message in cases:
+        state.kind = kind
         with pytest.raises(ValueError, match=message):
-            generator.create_speech(llama=llama, text="hello", **options)
+            generator.create_speech(**{"llama": llama, "text": "hello", **options})
     backend.mtmd_helper_gen_audio_init.assert_not_called()
     llama.reset.assert_not_called()
     factory.assert_not_called()
-    audio = generator.create_speech(llama=llama, text="hello", max_frames=2)
-    assert audio.finish_reason == "length" and audio.sample_rate == 32000
-    assert state.tokens == [42, 42]
+
+    state.kind = 3
+    assert generator.create_speech(llama=llama, text="hello").finish_reason == "stop"
 
 
-def test_tts_validates_model_and_request_before_decode(audio_pipeline):
+def test_tts_pocket_predefined_voice(audio_pipeline):
     generator, llama, backend, state, _, _ = audio_pipeline
-    for options in ({"text": " "}, {"max_frames": 0}, {"seed": -1}, {"response_format": "mp3"}):
-        with pytest.raises(ValueError):
-            generator.create_speech(**{"llama": llama, "text": "hello", **options})
     state.kind = 2
-    with pytest.raises(ValueError, match="requires speaker_reference"):
-        generator.create_speech(llama=llama, text="hello")
-    state.kind = 0
-    with pytest.raises(ValueError, match="supported TTS"):
-        generator.create_speech(llama=llama, text="hello")
-    backend.mtmd_helper_gen_audio_init.assert_not_called()
+    assert generator.create_speech(llama=llama, text="hello", voice="alba").finish_reason == "stop"
+    assert state.speaker == 987
+    backend.mtmd_gen_audio_get_voice.assert_called_once_with(123, b"alba")
+    backend.mtmd_bitmap_free.assert_called_once_with(987)
+    with pytest.raises(ValueError, match="Unknown predefined voice"):
+        generator.create_speech(llama=llama, text="hello", voice="missing")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        generator.create_speech(llama=llama, text="hello", voice="alba", speaker_reference=b"audio")
+    state.fail = "set_input"
+    with pytest.raises(RuntimeError):
+        generator.create_speech(llama=llama, text="hello", voice="alba")
+    assert backend.mtmd_bitmap_free.call_count == 2
+
+
+@pytest.mark.parametrize("multilingual,cfg,sequences,unified,error", [
+    (False, False, 1, False, None),
+    (True, False, 2, True, "classifier_free_guidance=true"),
+    (True, None, 2, True, "missing CFG query"),
+    (True, True, 1, True, "n_seq_max=2, kv_unified=True"),
+    (True, True, 2, False, "n_seq_max=2, kv_unified=True"),
+    (True, True, 2, True, None), (True, True, 4, True, None),
+])
+def test_tts_chatterbox_cfg_and_reference(audio_pipeline, multilingual, cfg, sequences, unified, error):
+    generator, llama, backend, state, _, _ = audio_pipeline
+    native = importlib.import_module("llama_cpp.mtmd_cpp")
+    state.kind, state.multilingual = 5, multilingual
+    llama._ctx.n_seq_max = lambda: sequences
+    llama.context_params.n_seq_max = sequences
+    llama.context_params.kv_unified = unified
+    query = llama._model.classifier_free_guidance
+    query.return_value = cfg
+    if cfg is None:
+        query.side_effect = RuntimeError("missing CFG query")
+    generator.capabilities = native.mtmd_helper_cap(audio_gen=True, audio_gen_spk_ref=False)
+    if error is None:
+        for _ in range(2):
+            assert generator.create_speech(llama=llama, text="hello", speaker_reference=b"RIFF0000WAVE").finish_reason == "stop"
+        assert state.speaker == 789
+        assert backend.mtmd_bitmap_free.call_count == 2
+    else:
+        with pytest.raises((ValueError, RuntimeError), match=error):
+            generator.create_speech(llama=llama, text="hello", speaker_reference=b"RIFF0000WAVE")
+        backend.mtmd_helper_gen_audio_init.assert_not_called()
+    assert query.call_count == (0 if not multilingual else 2 if error is None else 1)
+    assert llama._ctx.n_seq_max() == llama.context_params.n_seq_max == sequences
+    assert llama.context_params.kv_unified is unified
+
+
+@pytest.mark.parametrize("supports_reference", [False, True])
+def test_tts_reference_uses_generation_capability(audio_pipeline, supports_reference):
+    generator, llama, backend, _, _, _ = audio_pipeline
+    native = importlib.import_module("llama_cpp.mtmd_cpp")
+    generator.capabilities = native.mtmd_helper_cap(audio_gen=True, audio_gen_spk_ref=supports_reference)
+    generator.is_support_audio = not supports_reference
+    if supports_reference:
+        audio = generator.create_speech(llama=llama, text="hello", speaker_reference=b"RIFF0000WAVE")
+        assert audio.finish_reason == "stop"
+        backend.mtmd_bitmap_free.assert_called_once_with(789)
+    else:
+        with pytest.raises(ValueError, match="reference audio"):
+            generator.create_speech(llama=llama, text="hello", speaker_reference=b"RIFF0000WAVE")
+        backend.mtmd_helper_gen_audio_init.assert_not_called()
 
 
 def test_tts_rejects_rebinding_and_closed_generator(audio_pipeline):
@@ -1333,24 +1501,18 @@ def test_tts_rejects_concurrent_use(audio_pipeline):
     assert generator.create_speech(llama=llama, text="hello").finish_reason == "stop"
 
 
-def test_generated_audio_wav_save(tmp_path):
-    import io
+def test_generated_audio_wav_save(tmp_path, audio_pipeline):
     import wave
-    from llama_cpp.llama_multimodal import GeneratedAudio
 
-    data = io.BytesIO()
-    with wave.open(data, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(24000)
-        wav.writeframes(b"\x00\x00\x01\x00")
-    result = GeneratedAudio(data.getvalue(), 24000, 2, "wav", "stop")
+    generator, llama, *_ = audio_pipeline
+    result = generator.create_speech(llama=llama, text="hello")
     path = tmp_path / "speech.wav"
     result.save(path)
+    assert path.read_bytes() == result.data
     with wave.open(str(path), "rb") as wav:
         assert wav.getnframes() == result.n_samples
         assert wav.getframerate() == result.sample_rate
-        assert wav.readframes(2) == b"\x00\x00\x01\x00"
+        assert wav.readframes(result.n_samples) == b"\x00\x00\x01\x00\xff\xff\x00\x00"
 
 
 @pytest.mark.parametrize("values", [[], [float("nan"), 0.0], [float("inf"), 0.0], [-1.0]*4, [0.0]*4, [0.2]*4, [-1.0, 1.0]*50, [2.0, 0.0]])

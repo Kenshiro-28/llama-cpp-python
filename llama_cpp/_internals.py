@@ -126,6 +126,12 @@ class LlamaModel:
     def n_ctx_train(self) -> int:
         return llama_cpp.llama_model_n_ctx_train(self.model)
 
+    def classifier_free_guidance(self) -> bool:
+        """Return the native model's CFG metadata flag without changing capacity."""
+        if self.model is None:
+            raise RuntimeError("Cannot query classifier-free guidance on a closed model")
+        return llama_cpp.llama_model_classifier_free_guidance(self.model)
+
     def n_cls_out(self) -> int:
         return llama_cpp.llama_model_n_cls_out(self.model)
 
@@ -1277,6 +1283,7 @@ class LlamaContext:
         The context borrows the native sampler pointer, so this wrapper retains
         a strong reference while it is attached. Passing ``None`` detaches the
         sampler. Changing an attached sampler can force graph reallocation.
+        Pending backend work is synchronized before changing borrowed pointers.
 
         Returns:
             Whether llama.cpp accepted the sampler change.
@@ -1288,12 +1295,14 @@ class LlamaContext:
             if not sampler_ptr:
                 raise RuntimeError("Cannot attach a closed or invalid sampler")
 
+        self.synchronize()
         changed = bool(llama_cpp.llama_set_sampler(self.ctx, seq_id, sampler_ptr))
-        if changed:
-            if sampler is None:
-                self._sampler_refs.pop(seq_id, None)
-            else:
-                self._sampler_refs[seq_id] = sampler
+        if changed and sampler is not None:
+            self._sampler_refs[seq_id] = sampler
+        else:
+            # Native rejection also detaches the previous sampler. Exceptions
+            # above leave ownership unchanged because completion is unknown.
+            self._sampler_refs.pop(seq_id, None)
         return changed
 
     def get_sampled_token_ith(self, i: int) -> int:
@@ -1448,6 +1457,21 @@ class LlamaContext:
                 f"LlamaContext.get_embeddings_layer_inp: layer {layer_id} output is unavailable"
             )
         return embeddings
+
+    def set_embeddings_layer_inp_dev(self, enabled: bool) -> None:
+        """Capture enabled layer inputs in a reusable device buffer.
+
+        Configure before decoding. Rows follow input batch indices and layers
+        follow ascending IDs. Host layer-input accessors are unavailable while
+        this mode is enabled. Changing the setting synchronizes native work.
+        """
+        self._assert_ctx()
+        llama_cpp.llama_set_embeddings_layer_inp_dev(self.ctx, enabled)
+
+    def supports_embd_row(self) -> bool:
+        """Whether this context can decode device rows captured by ctx_other."""
+        self._assert_ctx()
+        return llama_cpp.llama_supports_embd_row(self.ctx)
 
     def set_nextn_layer_offset(self, offset: int) -> None:
         """Select the appended NextN block used by a DECODER_MTP graph.
@@ -1662,6 +1686,7 @@ class LlamaBatchEntry:
     output: bool = False
     decision_order: int = 0
     state: Optional[npt.NDArray[np.float32]] = None
+    embd_row: Optional[int] = None
 
 
 class LlamaBatchExt:
@@ -1676,6 +1701,8 @@ class LlamaBatchExt:
       Paired entries cannot share a submitted range with unpaired entries.
     * ``state=`` / ``states=``: separate hidden states, e.g. from the MTP target.
       A submitted range must carry states on every entry or on none.
+    * ``add_embd_row``: borrowed device features from ctx_other. Every entry in
+      the submitted range must be a device row; consume before the peer decodes.
 
     Single-entry methods append one input; bulk methods append a validated span.
     Text/paired positions are scalar; embedding positions have one or four axes
@@ -1763,14 +1790,20 @@ class LlamaBatchExt:
             raise ValueError("seq_ids must be nonempty and within context sequence capacity")
         return ids
 
-    def _entry(self, token, embedding, position, seq_ids, output, decision_order, *, state=None, validated_seq_ids=None):
+    def _entry(self, token, embedding, position, seq_ids, output, decision_order, *, state=None, embd_row=None, validated_seq_ids=None):
         """Validate input metadata and construct a logical entry without copying features."""
         if token is not None:
             token = self._integer(token, "token")
             if not 0 <= token < self._n_vocab:
                 raise ValueError("token is outside the context vocabulary")
-        if token is None and embedding is None:
-            raise ValueError("An entry requires a token or embedding")
+        if embd_row is not None:
+            embd_row = self._integer(embd_row, "embd_row")
+            if not 0 <= embd_row <= 2**31 - 1:
+                raise ValueError("embd_row must be a nonnegative int32")
+            if token is not None or embedding is not None:
+                raise ValueError("A device row cannot carry a token or embedding")
+        if token is None and embedding is None and embd_row is None:
+            raise ValueError("An entry requires a token, embedding or device row")
         ids = self._seq_ids(seq_ids) if validated_seq_ids is None else validated_seq_ids
         n_pos = 1 if token is not None else self._n_pos
         if isinstance(position, (int, np.integer)):
@@ -1782,7 +1815,7 @@ class LlamaBatchExt:
         order = self._integer(decision_order, "decision_order")
         if order not in self._decision_orders:
             raise ValueError("Unknown decision_order")
-        return LlamaBatchEntry(token, embedding, pos, ids, bool(output), order, state)
+        return LlamaBatchEntry(token, embedding, pos, ids, bool(output), order, state, embd_row)
 
     @staticmethod
     def _embedding(data, name="embedding"):
@@ -1831,6 +1864,20 @@ class LlamaBatchExt:
         self._require_open()
         state = None if state is None else self._embedding(state, "state")
         entry = self._entry(token, None, position, seq_ids, output, decision_order, state=state)
+        self._entries.append(entry)
+        return len(self) - 1
+
+    def add_embd_row(self, row: int, position, seq_ids: Sequence[int] = (0,), output: bool = False) -> int:
+        """Reference a device feature row from ctx_other; return its entry index.
+
+        row (int): Nonnegative index in the peer's latest input batch.
+        position (int or Sequence[int]): Scalar or four axes for M-RoPE.
+        The features are borrowed, without a host copy. Submit before the peer
+        decodes again. Use valid source row indices; native processing checks
+        whether the backend can read the peer's buffer.
+        """
+        self._require_open()
+        entry = self._entry(None, None, position, seq_ids, output, 0, embd_row=row)
         self._entries.append(entry)
         return len(self) - 1
 
@@ -1926,6 +1973,9 @@ class LlamaBatchExt:
         if count > self._capacity:
             raise ValueError("Batch range exceeds context.n_batch(); submit a smaller range")
         entries = self._entries[start:start + count]
+        device_rows = sum(e.embd_row is not None for e in entries)
+        if device_rows and device_rows != count:
+            raise ValueError("Device rows cannot mix with token or embedding entries")
         widths = {e.embedding.size for e in entries if e.embedding is not None}
         if len(widths) > 1:
             raise ValueError("All submitted embeddings must have the same flattened width")
@@ -1948,7 +1998,9 @@ class LlamaBatchExt:
                         data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                         1 if data.ndim == 1 else data.shape[0], data.shape[-1],
                     )
-                if e.token is not None:
+                if e.embd_row is not None:
+                    idx = llama_cpp.llama_batch_ext_add_embd_row(self._native, e.seq_ids[0], e.embd_row)
+                elif e.token is not None:
                     idx = llama_cpp.llama_batch_ext_add_token(self._native, e.seq_ids[0], e.token)
                 else:
                     idx = llama_cpp.llama_batch_ext_add_embd(self._native, e.seq_ids[0], embd)

@@ -399,6 +399,7 @@ LLAMA_TOKEN_ATTR_SINGLE_WORD = 1 << 9
 #     LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+#     LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
 #
 #     LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
 # };
@@ -445,6 +446,7 @@ class llama_ftype(enum.IntEnum):
     LLAMA_FTYPE_MOSTLY_NVFP4 = 39
     LLAMA_FTYPE_MOSTLY_Q1_0 = 40
     LLAMA_FTYPE_MOSTLY_Q2_0 = 41
+    LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42
     LLAMA_FTYPE_GUESSED = 1024
 
 # // Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
@@ -6056,6 +6058,72 @@ def llama_get_embeddings_layer_inp(
     """
     ...
 
+# LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
+@ctypes_function_llama_ext(
+    [
+        "llama_set_embeddings_layer_inp_dev",
+        "?llama_set_embeddings_layer_inp_dev@@YAXPEAUllama_context@@_N@Z",
+        "__Z34llama_set_embeddings_layer_inp_devP13llama_contextb",
+        "_Z34llama_set_embeddings_layer_inp_devP13llama_contextb",
+    ],
+    [llama_context_p_ctypes, ctypes.c_bool],
+    None,
+    required=False,
+)
+def llama_set_embeddings_layer_inp_dev(ctx: llama_context_p, value: bool) -> None:
+    """Capture enabled layer inputs on the device instead of in host buffers.
+
+    Rows follow the original input batch order, with layers concatenated in
+    ascending layer-ID order. Configure before decoding. The context owns the
+    buffer, which is reused by subsequent evaluations.
+    """
+    ...
+
+
+# LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
+@ctypes_function_llama_ext(
+    [
+        "llama_supports_embd_row",
+        "?llama_supports_embd_row@@YA_NPEBUllama_context@@@Z",
+        "__Z23llama_supports_embd_rowPK13llama_context",
+        "_Z23llama_supports_embd_rowPK13llama_context",
+    ],
+    [llama_context_p_ctypes],
+    ctypes.c_bool,
+    required=False,
+)
+def llama_supports_embd_row(ctx: llama_context_p) -> bool:
+    """Whether this DFlash/DSpark context can read ctx_other's device features.
+
+    Enable device layer-input capture on ctx_other before querying. A backend
+    must support reading that buffer for this to return True.
+    """
+    ...
+
+
+# LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
+@ctypes_function_llama_ext(
+    [
+        "llama_batch_ext_add_embd_row",
+        "?llama_batch_ext_add_embd_row@@YAHPEAUllama_batch_ext@@HH@Z",
+        "__Z28llama_batch_ext_add_embd_rowP15llama_batch_extii",
+        "_Z28llama_batch_ext_add_embd_rowP15llama_batch_extii",
+    ],
+    [llama_batch_ext_p_ctypes, llama_seq_id, ctypes.c_int32],
+    ctypes.c_int32,
+    required=False,
+)
+def llama_batch_ext_add_embd_row(batch: llama_batch_ext_p, seq_id: int, row: int) -> int:
+    """Append a reference to a row of ctx_other's layer-input device buffer.
+
+    Set positions with llama_batch_ext_set_pos(). All submitted entries must
+    reference device rows, without token IDs or host embeddings. Returns the
+    batch index, or a negative add error code. Consume before ctx_other reuses
+    its buffer; this call does not copy or own the source features.
+    """
+    ...
+
+
 # LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 @ctypes_function_llama_ext(
     [
@@ -6219,4 +6287,22 @@ def llama_model_get_tok_embd_rows(
 )
 def llama_model_n_tokens_delay(model: llama_model_p) -> int:
     """Return realtime audio output delay in tokens, or 0 when not applicable."""
+    ...
+
+
+# // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
+# LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+@ctypes_function_llama_ext(
+    [
+        "llama_model_classifier_free_guidance",
+        "?llama_model_classifier_free_guidance@@YA_NPEBUllama_model@@@Z",
+        "__Z36llama_model_classifier_free_guidancePK11llama_model",
+        "_Z36llama_model_classifier_free_guidancePK11llama_model",
+    ],
+    [llama_model_p_ctypes],
+    ctypes.c_bool,
+    required=False,
+)
+def llama_model_classifier_free_guidance(model: llama_model_p) -> bool:
+    """Return whether model metadata requires classifier-free guidance."""
     ...

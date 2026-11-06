@@ -166,7 +166,8 @@ class GGMLStatus(enum.IntEnum):
 #     GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
 #     GGML_TYPE_Q1_0    = 41,
 #     GGML_TYPE_Q2_0    = 42,
-#     GGML_TYPE_COUNT   = 42,
+#     GGML_TYPE_F8_E4M3 = 43,
+#     GGML_TYPE_COUNT   = 44,
 # };
 class GGMLType(enum.IntEnum):
     GGML_TYPE_F32  = 0
@@ -204,17 +205,34 @@ class GGMLType(enum.IntEnum):
     GGML_TYPE_NVFP4 = 40
     GGML_TYPE_Q1_0 = 41
     GGML_TYPE_Q2_0 = 42
-    GGML_TYPE_COUNT = 43
+    GGML_TYPE_F8_E4M3 = 43
+    GGML_TYPE_COUNT = 44
+
+
+class ggml_fp8_e4m3_t(ctypes.Structure):
+    """OCP FP8 E4M3 storage; bits are not a Python floating-point value."""
+
+    _fields_ = [("bits", ctypes.c_uint8)]
 
 
 # // precision
 # enum ggml_prec {
-#     GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
+#     GGML_PREC_UNDEFINED = 0,
+#     GGML_PREC_DEFAULT =  0, // deprecated alias
 #     GGML_PREC_F32     = 10,
+#     GGML_PREC_BF16    = 15,
+#     GGML_PREC_F16     = 20,
+#     GGML_PREC_Q8      = 30,
+#     GGML_PREC_Q4      = 40,
 # };
 class GGMLPrec(enum.IntEnum):
+    GGML_PREC_UNDEFINED = 0
     GGML_PREC_DEFAULT =  0
     GGML_PREC_F32     = 10
+    GGML_PREC_BF16    = 15
+    GGML_PREC_F16     = 20
+    GGML_PREC_Q8      = 30
+    GGML_PREC_Q4      = 40
 
 
 # // op hint
@@ -257,6 +275,7 @@ class GGMLOpHint(enum.IntEnum):
 #     GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
 #     GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
 #     GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+#     GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
 # };
 class GGMLFType(enum.IntEnum):
     GGML_FTYPE_UNKNOWN        = -1
@@ -287,6 +306,7 @@ class GGMLFType(enum.IntEnum):
     GGML_FTYPE_MOSTLY_NVFP4   = 26
     GGML_FTYPE_MOSTLY_Q1_0    = 27
     GGML_FTYPE_MOSTLY_Q2_0    = 28
+    GGML_FTYPE_MOSTLY_F8_E4M3 = 29
 
 
 # // available tensor operations:
@@ -386,6 +406,7 @@ class GGMLFType(enum.IntEnum):
 #     GGML_OP_DSV4_HC_COMB,
 #     GGML_OP_DSV4_HC_PRE,
 #     GGML_OP_DSV4_HC_POST,
+#     GGML_OP_TOP_K_MASK,
 
 #     GGML_OP_UNARY,
 
@@ -500,23 +521,24 @@ class GGML_OP(enum.IntEnum):
     GGML_OP_DSV4_HC_COMB = 88
     GGML_OP_DSV4_HC_PRE = 89
     GGML_OP_DSV4_HC_POST = 90
+    GGML_OP_TOP_K_MASK = 91
 
-    GGML_OP_UNARY = 91
+    GGML_OP_UNARY = 92
 
-    GGML_OP_MAP_CUSTOM1 = 92
-    GGML_OP_MAP_CUSTOM2 = 93
-    GGML_OP_MAP_CUSTOM3 = 94
+    GGML_OP_MAP_CUSTOM1 = 93
+    GGML_OP_MAP_CUSTOM2 = 94
+    GGML_OP_MAP_CUSTOM3 = 95
 
-    GGML_OP_CUSTOM = 95
+    GGML_OP_CUSTOM = 96
 
-    GGML_OP_CROSS_ENTROPY_LOSS = 96
-    GGML_OP_CROSS_ENTROPY_LOSS_BACK = 97
-    GGML_OP_OPT_STEP_ADAMW = 98
-    GGML_OP_OPT_STEP_SGD = 99
+    GGML_OP_CROSS_ENTROPY_LOSS = 97
+    GGML_OP_CROSS_ENTROPY_LOSS_BACK = 98
+    GGML_OP_OPT_STEP_ADAMW = 99
+    GGML_OP_OPT_STEP_SGD = 100
 
-    GGML_OP_GLU = 100
+    GGML_OP_GLU = 101
 
-    GGML_OP_COUNT = 101
+    GGML_OP_COUNT = 102
 
 # enum ggml_unary_op {
 #     GGML_UNARY_OP_ABS,
@@ -793,6 +815,22 @@ ggml_tensor._fields_ = [
         ("padding", ctypes.c_char * 8),
 ]
 
+
+@ggml_base_function(
+    "ggml_flash_attn_ext_rows",
+    [ggml_context_p, ggml_tensor_p, ggml_tensor_p, ggml_tensor_p,
+     ggml_tensor_p, ggml_tensor_p, ctypes.c_float, ctypes.c_float, ctypes.c_float],
+    ggml_tensor_p,
+    required=False,
+)
+def ggml_flash_attn_ext_rows(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap):
+    """Build flash attention with per-slice I32 KV row indices.
+
+    Negative row indices are padding and must have -inf mask entries.
+    The caller owns the context and must supply compatible tensor shapes.
+    """
+    ...
+
 # // Abort callback
 # // If not NULL, called before ggml computation
 # // If it returns true, the computation is aborted
@@ -897,7 +935,7 @@ class GGMLOptBuildType(enum.IntEnum):
 
 #     GGML_OPT_OPTIMIZER_TYPE_COUNT
 # };
-class GGMLOptBuildType(enum.IntEnum):
+class GGMLOptOptimizerType(enum.IntEnum):
     GGML_OPT_OPTIMIZER_TYPE_ADAMW = 0
     GGML_OPT_OPTIMIZER_TYPE_SGD   = 1
     GGML_OPT_OPTIMIZER_TYPE_COUNT = 2
@@ -1381,6 +1419,49 @@ def ggml_backend_tensor_copy(src, dst):
     ...
 
 
+@ggml_base_function(
+    "ggml_backend_tensor_copy_n",
+    [ctypes.POINTER(ggml_tensor_p), ctypes.POINTER(ggml_tensor_p), ctypes.c_size_t],
+    None,
+    required=False,
+)
+def ggml_backend_tensor_copy_n(srcs, dsts, n_tensors):
+    """Copy n_tensors pairs of allocated tensors with matching layouts."""
+    ...
+
+
+@ggml_base_function(
+    "ggml_backend_tensor_set_n",
+    [ctypes.POINTER(ggml_tensor_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+     ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t],
+    None,
+    required=False,
+)
+def ggml_backend_tensor_set_n(tensors, data, offsets, sizes, data_offsets, n_tensors):
+    """Write from a shared host buffer; all offsets and sizes are in bytes.
+
+    Each array must contain n_tensors entries. Tensors must be allocated and
+    both tensor and host ranges must fit their buffers.
+    """
+    ...
+
+
+@ggml_base_function(
+    "ggml_backend_tensor_get_n",
+    [ctypes.POINTER(ggml_tensor_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+     ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.c_size_t],
+    None,
+    required=False,
+)
+def ggml_backend_tensor_get_n(tensors, data, offsets, sizes, data_offsets, n_tensors):
+    """Read into a writable host buffer; offsets and sizes are in bytes.
+
+    Each array must contain n_tensors entries. Tensors must be allocated and
+    both tensor and host ranges must fit their buffers.
+    """
+    ...
+
+
 # GGML_API enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr);
 @ggml_base_function("ggml_backend_tensor_alloc", [ctypes.c_void_p, ggml_tensor_p, ctypes.c_void_p], ctypes.c_int)
 def ggml_backend_tensor_alloc(buffer, tensor, addr):
@@ -1696,6 +1777,19 @@ def ggml_backend_reg_dev_get(reg: ggml_backend_reg_t, index: int) -> ggml_backen
 def ggml_backend_reg_get_proc_address(reg: ggml_backend_reg_t, name: bytes) -> Optional[int]:
     """Get a backend-specific function pointer, or None if unavailable."""
     ...
+
+
+# Cast the address returned by ggml_backend_reg_get_proc_address to this type.
+# Keep the bootstrap callback and its user data alive for the native call.
+# typedef bool (*ggml_backend_comm_bootstrap_callback)(void * user_data, const void * send_buf, void * recv_buf, size_t size);
+ggml_backend_comm_bootstrap_callback = ctypes.CFUNCTYPE(
+    ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+)
+# typedef void * (*ggml_backend_comm_init_rank_t)(ggml_backend_t backend, int rank, int world_size, ggml_backend_comm_bootstrap_callback bootstrap_callback, void * bootstrap_callback_data);
+ggml_backend_comm_init_rank_t = ctypes.CFUNCTYPE(
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    ggml_backend_comm_bootstrap_callback, ctypes.c_void_p,
+)
 
 
 # //
@@ -2055,6 +2149,8 @@ def ggml_backend_cpu_buffer_from_ptr(
     """
     Wrap caller-owned host memory in a CPU backend buffer.
     The host allocation must remain valid until the buffer is freed.
+    Its address must satisfy ggml_backend_buft_get_alignment() for the CPU
+    buffer type; ordinary ctypes arrays do not guarantee this alignment.
     """
     ...
 
@@ -2124,6 +2220,7 @@ class ggml_hash_set(ctypes.Structure):
 #     struct ggml_hash_set visited_hash_set;
 
 #     enum ggml_cgraph_eval_order order;
+#     uint64_t uid; // zero means no graph identity is assigned
 # };
 class ggml_cgraph(ctypes.Structure):
     if TYPE_CHECKING:
@@ -2137,6 +2234,7 @@ class ggml_cgraph(ctypes.Structure):
         use_counts: ctypes.POINTER(ctypes.c_int32)  # type: ignore
         visited_hash_set: ggml_hash_set
         order: int
+        uid: int
 
     _fields_ = [
         ("size", ctypes.c_int),
@@ -2149,4 +2247,5 @@ class ggml_cgraph(ctypes.Structure):
         ("use_counts", ctypes.POINTER(ctypes.c_int32)),
         ("visited_hash_set", ggml_hash_set),
         ("order", ctypes.c_int),
+        ("uid", ctypes.c_uint64),
     ]
