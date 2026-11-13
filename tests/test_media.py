@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import threading
 import struct
 from contextlib import ExitStack
+from operator import attrgetter
 
 import pytest
 from jinja2.exceptions import TemplateError
@@ -563,10 +564,19 @@ def test_chat_prefill_mtp_callback_and_cleanup(chat_prefill, failure):
     handler._free_mtmd_resources.assert_called_once()
 
 
-
 @pytest.fixture
 def mtmd():
     return importlib.import_module("llama_cpp.mtmd_cpp")
+
+
+@pytest.fixture
+def native_chunks(mtmd):
+    chunks = mtmd.mtmd_test_create_input_chunks()
+    assert chunks
+    try:
+        yield chunks
+    finally:
+        mtmd.mtmd_input_chunks_free(chunks)
 
 
 @pytest.mark.parametrize("name, fields", [
@@ -582,20 +592,32 @@ def test_mtmd_boolean_capabilities_abi(mtmd, name, fields):
     assert [getattr(struct_type, field).offset for field in fields] == list(range(len(fields)))
 
 
+VIDEO_DEFAULTS = dict(fps_target=4.0, ffmpeg_bin_dir=None, timestamp_interval_ms=5000, no_soundtrack=False)
+
+
 @pytest.mark.parametrize("name, expected, free", [
+    ("mtmd_helper_video_init_params", VIDEO_DEFAULTS, None),
+    ("mtmd_helper_init_opt", {"video_params." + key: value for key, value in VIDEO_DEFAULTS.items()}, None),
     ("mtmd_audio_stream_params", dict(step_ms=320, prompt=None, n_prompt=0), "mtmd_audio_stream_free"),
     ("mtmd_gen_state_params", dict(seed=0xFFFFFFFF), "mtmd_gen_state_free"),
     ("mtmd_helper_gen_audio_inp", dict(stream=False, seq_id=0, prompt=None, prompt_len=0,
                                      n_past=0, out_mode=0, speaker_ref=None, lang=None,
-                                     top_k=50, top_p=1.0, seed=0xFFFFFFFF, out_type=1), None),
+                                     top_k=50, top_p=1.0, temp=-1.0, seed=0xFFFFFFFF, out_type=1), None),
 ])
-def test_mtmd_audio_defaults(mtmd, name, expected, free):
+def test_mtmd_parameter_defaults(mtmd, name, expected, free):
     default = getattr(mtmd, name + "_default")
     if getattr(default, "__ctypes_optional__", False):
         pytest.skip(f"This libmtmd does not provide {name}")
+    if name == "mtmd_helper_video_init_params":
+        assert getattr(mtmd, name)._fields_ == [
+            ("fps_target", ctypes.c_float), ("ffmpeg_bin_dir", ctypes.c_char_p),
+            ("timestamp_interval_ms", ctypes.c_int64), ("no_soundtrack", ctypes.c_bool),
+        ]
+    elif name == "mtmd_helper_init_opt":
+        assert getattr(mtmd, name)._fields_ == [("video_params", mtmd.mtmd_helper_video_init_params)]
     params = default()
     for field, expected_value in expected.items():
-        actual = getattr(params, field)
+        actual = attrgetter(field)(params)
         assert (not actual if expected_value is None else actual == expected_value), field
     if free:
         getattr(mtmd, free)(None)
@@ -605,6 +627,10 @@ def test_mtmd_helper_function_signatures(mtmd):
     native = importlib.import_module("llama_cpp.llama_cpp")
     ptr = ctypes.POINTER
     signatures = [
+        ("mtmd_helper_resampler_init", [ctypes.c_int32, ctypes.c_int32], mtmd.mtmd_helper_resampler_p_ctypes),
+        ("mtmd_helper_resampler_free", [mtmd.mtmd_helper_resampler_p_ctypes], None),
+        ("mtmd_helper_resampler_process", [mtmd.mtmd_helper_resampler_p_ctypes, ptr(ctypes.c_float),
+                                          ctypes.c_size_t, ptr(ptr(ctypes.c_float))], ctypes.c_int64),
         ("mtmd_helper_get_capabilities", [native.llama_model_p_ctypes, mtmd.mtmd_context_p_ctypes], mtmd.mtmd_helper_cap),
         ("mtmd_audio_stream_get_n_rows", [mtmd.mtmd_audio_stream_p_ctypes], ctypes.c_int64),
         ("mtmd_audio_stream_get_n_rows_flushed", [mtmd.mtmd_audio_stream_p_ctypes], ctypes.c_int64),
@@ -649,13 +675,51 @@ def test_mtmd_helper_function_signatures(mtmd):
     assert mtmd.mtmd_helper_video_init.restype is mtmd.mtmd_helper_video_p_ctypes
 
 
+@pytest.mark.parametrize("rate_in,rate_out", [(16000, 16000), (48000, 16000), (16000, 24000), (44100, 16000)])
+def test_mtmd_resampler_stream_and_lifetime(mtmd, rate_in, rate_out):
+    import numpy as np
+
+    if getattr(mtmd.mtmd_helper_resampler_init, "__ctypes_optional__", False):
+        pytest.skip("This libmtmd does not provide the streaming resampler")
+    if rate_in == rate_out:
+        for rates in ((0, rate_out), (rate_in, 0), (-1, rate_out), (rate_in, -1)):
+            assert not mtmd.mtmd_helper_resampler_init(*rates)
+        mtmd.mtmd_helper_resampler_free(None)
+    samples = np.sin(2 * np.pi * 440 * np.arange(rate_in // 10) / rate_in).astype(np.float32)
+    ptr = ctypes.POINTER(ctypes.c_float)
+
+    def resample(chunk_size):
+        ctx = mtmd.mtmd_helper_resampler_init(rate_in, rate_out)
+        assert ctx
+        try:
+            chunks = []
+            for offset in range(0, len(samples), chunk_size):
+                chunk = samples[offset:offset + chunk_size]
+                out = ptr()
+                count = mtmd.mtmd_helper_resampler_process(ctx, chunk.ctypes.data_as(ptr), len(chunk), ctypes.byref(out))
+                assert count >= 0
+                if rate_in == rate_out:
+                    assert count == len(chunk)
+                    assert ctypes.cast(out, ctypes.c_void_p).value == chunk.ctypes.data
+                if count:
+                    # Copy before the next call or context release invalidates native storage.
+                    chunks.append(np.ctypeslib.as_array(out, shape=(count,)).copy())
+            out = ptr()
+            assert mtmd.mtmd_helper_resampler_process(ctx, samples.ctypes.data_as(ptr), 0, ctypes.byref(out)) == 0
+            return np.concatenate(chunks)
+        finally:
+            mtmd.mtmd_helper_resampler_free(ctx)
+
+    whole, streamed = resample(len(samples)), resample(137)
+    assert np.isfinite(streamed).all()
+    assert abs(len(streamed) - len(samples) * rate_out / rate_in) < 64
+    np.testing.assert_allclose(streamed, whole, rtol=1e-5, atol=1e-6)
+    if rate_in == rate_out:
+        np.testing.assert_array_equal(streamed, samples)
+
+
 @pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="64-bit MTMD ABI")
 @pytest.mark.parametrize("name, size, offsets", [
-    ("clip_context_params", 72, {
-        "use_gpu": 0, "device": 8, "flash_attn_type": 16, "image_min_tokens": 20,
-        "image_max_tokens": 24, "warmup": 28, "cb_eval": 32, "cb_eval_user_data": 40,
-        "no_alloc": 48, "progress_callback": 56, "progress_callback_user_data": 64,
-    }),
     ("mtmd_gen_inp", 72, {
         "type": 0, "code0": 4, "embd": 8, "top_k": 16, "top_p": 20,
         "temp": 24, "penalty_repeat": 28, "penalty_last_n": 32,
@@ -672,10 +736,10 @@ def test_mtmd_helper_function_signatures(mtmd):
                                          "timestamp_interval_ms": 16, "no_soundtrack": 24}),
     ("mtmd_helper_init_opt", 32, {"video_params": 0}),
     ("mtmd_gen_audio_info", 24, {"type": 0, "sample_rate": 4, "model_variant": 8, "n_voices": 16}),
-    ("mtmd_helper_gen_audio_inp", 64, {
+    ("mtmd_helper_gen_audio_inp", 72, {
         "stream": 0, "seq_id": 4, "prompt": 8, "prompt_len": 16,
         "n_past": 24, "out_mode": 28, "speaker_ref": 32, "lang": 40,
-        "top_k": 48, "top_p": 52, "seed": 56, "out_type": 60,
+        "top_k": 48, "top_p": 52, "temp": 56, "seed": 60, "out_type": 64,
     }),
 ])
 def test_mtmd_audio_struct_abi(mtmd, name, size, offsets):
@@ -690,7 +754,6 @@ def test_mtmd_audio_struct_abi(mtmd, name, size, offsets):
         assert value.seq_id == 7
 
 
-
 @pytest.mark.parametrize("name, values", [
     ("mtmd_gen_audio_type", [0, 1, 2, 3, 4, 5, 6]),
     ("mtmd_helper_gen_audio_out_mode", [0, 1, 2, 3]),
@@ -701,61 +764,50 @@ def test_mtmd_enums(mtmd, name, values):
     assert list(map(int, getattr(mtmd, name))) == values
 
 
-def test_mtmd_decoder_pos_abi(mtmd):
+def test_mtmd_decoder_pos_abi(mtmd, native_chunks):
     position = mtmd.mtmd_decoder_pos
     assert ctypes.sizeof(position) == 16
     assert ctypes.alignment(position) == ctypes.alignment(ctypes.c_uint32)
     assert [getattr(position, field).offset for field in ("t", "x", "y", "z")] == [0, 4, 8, 12]
 
     # Exercise native struct returns and array writes without loading a model.
-    chunks = mtmd.mtmd_test_create_input_chunks()
-    assert chunks
-    try:
-        chunk = mtmd.mtmd_input_chunks_get(chunks, 1)
-        image = mtmd.mtmd_input_chunk_get_tokens_image(chunk)
-        assert image
-        count = mtmd.mtmd_image_tokens_get_n_tokens(image)
-        assert count > 1
-        positions = (position * count)()
-        mtmd.mtmd_helper_image_get_decoder_pos(image, 7, positions)
-        for index, actual in enumerate(positions):
-            returned = mtmd.mtmd_image_tokens_get_decoder_pos(image, 7, index)
-            expected = (7 + index,) * 4
-            assert (actual.t, actual.x, actual.y, actual.z) == expected
-            assert (returned.t, returned.x, returned.y, returned.z) == expected
-    finally:
-        mtmd.mtmd_input_chunks_free(chunks)
+    chunk = mtmd.mtmd_input_chunks_get(native_chunks, 1)
+    image = mtmd.mtmd_input_chunk_get_tokens_image(chunk)
+    assert image
+    count = mtmd.mtmd_image_tokens_get_n_tokens(image)
+    assert count > 1
+    positions = (position * count)()
+    mtmd.mtmd_helper_image_get_decoder_pos(image, 7, positions)
+    for index, actual in enumerate(positions):
+        returned = mtmd.mtmd_image_tokens_get_decoder_pos(image, 7, index)
+        expected = (7 + index,) * 4
+        assert (actual.t, actual.x, actual.y, actual.z) == expected
+        assert (returned.t, returned.x, returned.y, returned.z) == expected
 
 
-def test_mtmd_chunk_serialization_writable_buffer(mtmd):
-    chunks = mtmd.mtmd_test_create_input_chunks()
-    assert chunks
-    try:
-        for index in range(mtmd.mtmd_input_chunks_size(chunks)):
-            chunk = mtmd.mtmd_input_chunks_get(chunks, index)
-            size = ctypes.c_size_t()
-            assert mtmd.mtmd_input_chunk_save(chunk, None, 0, ctypes.byref(size)) == 0
-            assert size.value > 0
-            # A sentinel also verifies that native serialization respects out_len.
-            output = (ctypes.c_uint8 * (size.value + 1))()
-            output[-1] = 0xA5
-            assert mtmd.mtmd_input_chunk_save(chunk, output, size.value - 1, ctypes.byref(size)) != 0
-            assert not any(output[:-1])
-            with pytest.raises(ctypes.ArgumentError):
-                mtmd.mtmd_input_chunk_save(chunk, b"\0" * size.value, size.value, ctypes.byref(size))
-            assert mtmd.mtmd_input_chunk_save(chunk, output, size.value, ctypes.byref(size)) == 0
-            assert output[-1] == 0xA5
-            restored = mtmd.mtmd_input_chunk_load(bytes(output[:-1]), size.value)
-            assert restored
-            try:
-                for name in ("type", "n_tokens", "n_pos", "id"):
-                    query = getattr(mtmd, "mtmd_input_chunk_get_" + name)
-                    assert query(restored) == query(chunk)
-            finally:
-                mtmd.mtmd_input_chunk_free(restored)
-    finally:
-        mtmd.mtmd_input_chunks_free(chunks)
-
+def test_mtmd_chunk_serialization_writable_buffer(mtmd, native_chunks):
+    for index in range(mtmd.mtmd_input_chunks_size(native_chunks)):
+        chunk = mtmd.mtmd_input_chunks_get(native_chunks, index)
+        size = ctypes.c_size_t()
+        assert mtmd.mtmd_input_chunk_save(chunk, None, 0, ctypes.byref(size)) == 0
+        assert size.value > 0
+        # A sentinel also verifies that native serialization respects out_len.
+        output = (ctypes.c_uint8 * (size.value + 1))()
+        output[-1] = 0xA5
+        assert mtmd.mtmd_input_chunk_save(chunk, output, size.value - 1, ctypes.byref(size)) != 0
+        assert not any(output[:-1])
+        with pytest.raises(ctypes.ArgumentError):
+            mtmd.mtmd_input_chunk_save(chunk, b"\0" * size.value, size.value, ctypes.byref(size))
+        assert mtmd.mtmd_input_chunk_save(chunk, output, size.value, ctypes.byref(size)) == 0
+        assert output[-1] == 0xA5
+        restored = mtmd.mtmd_input_chunk_load(bytes(output[:-1]), size.value)
+        assert restored
+        try:
+            for name in ("type", "n_tokens", "n_pos", "id"):
+                query = getattr(mtmd, "mtmd_input_chunk_get_" + name)
+                assert query(restored) == query(chunk)
+        finally:
+            mtmd.mtmd_input_chunk_free(restored)
 
 
 @pytest.mark.parametrize("n_pos", [1, 4])
@@ -786,27 +838,6 @@ def test_mtmd_helper_post_decode_callback(mtmd, n_pos):
         [1, 2, 3, 4, 5, 6], list(range(2 * n_pos)), 11,
     )]
     assert mtmd.mtmd_helper_decode_image_chunk.argtypes[8] is mtmd.mtmd_helper_post_decode_callback
-
-
-
-def test_mtmd_helper_init_opt_abi(mtmd):
-
-    assert mtmd.mtmd_helper_video_init_params._fields_ == [
-        ("fps_target", ctypes.c_float),
-        ("ffmpeg_bin_dir", ctypes.c_char_p),
-        ("timestamp_interval_ms", ctypes.c_int64),
-        ("no_soundtrack", ctypes.c_bool),
-    ]
-    assert mtmd.mtmd_helper_init_opt._fields_ == [
-        ("video_params", mtmd.mtmd_helper_video_init_params),
-    ]
-    opt = mtmd.mtmd_helper_init_opt_default()
-    assert opt.video_params.fps_target == 4.0
-    assert opt.video_params.ffmpeg_bin_dir is None
-    assert opt.video_params.timestamp_interval_ms == 5000
-    assert not opt.video_params.no_soundtrack
-    assert not mtmd.mtmd_helper_video_init_params_default().no_soundtrack
-
 
 
 @pytest.mark.parametrize("handler_name", ["MTMDBaseHandler", "MTMDChatHandler"])
@@ -844,7 +875,6 @@ def test_mtmd_chat_handler_video_options(tmp_path, make_handler, handler_name, n
         make_handler(handler_name, video_no_soundtrack="false")
 
 
-
 def test_mtmd_chat_handler_rejects_invalid_ffmpeg_bin_dir(tmp_path, make_handler):
     with pytest.raises(ValueError, match="is not an existing directory"):
         make_handler(video_ffmpeg_bin_dir=tmp_path / "missing")
@@ -874,7 +904,6 @@ def test_mtmd_context_initialization_and_close(tmp_path, handler_name, flash_att
         mtmd_support_audio_stream=Mock(return_value=True),
         mtmd_gen_audio_get_info=Mock(return_value=SimpleNamespace(type=0)),
         mtmd_context_params_default=native.mtmd_context_params_default,
-        clip_flash_attn_type=native.clip_flash_attn_type,
         mtmd_helper_log_set=Mock(),
         mtmd_default_marker=Mock(return_value=b"<default>"),
         mtmd_get_marker=Mock(return_value=b"<media>"),
@@ -1121,7 +1150,6 @@ def chunk_ledger(tmp_path, make_handler, monkeypatch):
     return handler, ledger
 
 
-
 @pytest.mark.parametrize("source, soundtrack", [("video", False), ("video", True), ("audio", False)])
 def test_media_chunk_identity_survives_expansion_before_image(chunk_ledger, source, soundtrack):
     _, ledger = chunk_ledger
@@ -1230,6 +1258,7 @@ def audio_pipeline(tmp_path, monkeypatch):
         inp = ctypes.cast(ptr, ctypes.POINTER(native.mtmd_helper_gen_audio_inp)).contents
         assert inp.stream is False and inp.seq_id == 0
         state.prompts.append((ctypes.string_at(inp.prompt, inp.prompt_len), inp.seed))
+        state.frame_temperature = inp.temp
         state.speaker = inp.speaker_ref
         state.steps = 0
         state.out_type = inp.out_type
@@ -1299,7 +1328,8 @@ def audio_pipeline(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", [1, 3, 5], ids=["qwen", "soprano", "chatterbox"])
-def test_tts_sampled_models_repeated_requests_copy_binary_output(audio_pipeline, kind):
+@pytest.mark.parametrize("options", [{}, {"temperature": None}, {"temperature": 0.0}, {"temperature": 0.7}])
+def test_tts_sampled_models_repeated_requests_copy_binary_output(audio_pipeline, kind, options):
     generator, llama, backend, state, factory, output = audio_pipeline
     state.kind = kind
     state.voices = int(kind == 5)
@@ -1307,13 +1337,16 @@ def test_tts_sampled_models_repeated_requests_copy_binary_output(audio_pipeline,
     text = "Hello" if kind == 3 else "你好"
     expected = output.raw[:-1]
     for _ in range(2):
-        result = generator.create_speech(llama=llama, text=text, seed=7, response_format="pcm_f32")
+        result = generator.create_speech(llama=llama, text=text, seed=7, response_format="pcm_f32", **options)
         assert result.data == expected
         assert result.finish_reason == "stop"
         assert result.sample_rate == (32000 if kind == 3 else 24000)
         assert result.duration == 4 / result.sample_rate
     output[0] = b"z"
     assert result.data == expected
+    temperature = options.get("temperature")
+    assert state.frame_temperature == pytest.approx(-1.0 if temperature is None else temperature)
+    assert factory.call_args.kwargs["temperature"] == (0.8 if temperature is None else temperature)
     assert state.prompts == [(text.encode(), 7)] * 2
     assert state.tokens == [42] * 6
     assert llama.reset.call_count == 4
@@ -1376,6 +1409,8 @@ def test_tts_validates_model_and_request_before_decode(audio_pipeline):
     generator, llama, backend, state, factory, _ = audio_pipeline
     cases = [
         (1, {"text": " "}, None), (1, {"max_frames": 0}, None),
+        *((2, {"temperature": value}, "temperature")
+          for value in (-1, float("nan"), float("inf"), float("-inf"), 1e39)),
         (1, {"seed": -1}, None), (1, {"response_format": "mp3"}, None),
         (0, {}, "supported TTS"), (2, {}, "requires speaker_reference"),
         (3, {"speaker_reference": "missing.wav"}, "speaker_reference"),
@@ -1397,10 +1432,14 @@ def test_tts_validates_model_and_request_before_decode(audio_pipeline):
     assert generator.create_speech(llama=llama, text="hello").finish_reason == "stop"
 
 
-def test_tts_pocket_predefined_voice(audio_pipeline):
-    generator, llama, backend, state, _, _ = audio_pipeline
+@pytest.mark.parametrize("temperature", [None, 0.0, 0.7])
+def test_tts_pocket_predefined_voice(audio_pipeline, temperature):
+    generator, llama, backend, state, factory, _ = audio_pipeline
     state.kind = 2
-    assert generator.create_speech(llama=llama, text="hello", voice="alba").finish_reason == "stop"
+    assert generator.create_speech(llama=llama, text="hello", voice="alba",
+                                   temperature=temperature).finish_reason == "stop"
+    assert state.frame_temperature == pytest.approx(-1.0 if temperature is None else temperature)
+    factory.assert_not_called()
     assert state.speaker == 987
     backend.mtmd_gen_audio_get_voice.assert_called_once_with(123, b"alba")
     backend.mtmd_bitmap_free.assert_called_once_with(987)

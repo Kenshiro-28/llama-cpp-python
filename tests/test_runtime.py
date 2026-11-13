@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 
 import pytest
 import numpy as np
@@ -76,6 +76,80 @@ def test_runtime_enums_match_vendor(header, enum_name, module, class_name):
         expected[name.strip()] = value
     enum_type = getattr(getattr(llama_cpp, module), class_name)
     assert {name: int(value) for name, value in enum_type.__members__.items()} == expected
+
+
+@pytest.mark.parametrize("header,name", [
+    ("include/llama.h", "llama_context_params"),
+    ("tools/mtmd/mtmd.h", "mtmd_context_params"),
+    ("tools/mtmd/mtmd-helper.h", "mtmd_helper_gen_audio_inp"),
+])
+def test_context_parameter_layout_matches_vendor(header, name):
+    from llama_cpp import mtmd_cpp
+
+    source = (Path(__file__).resolve().parents[1] / "vendor/llama.cpp" / header).read_text(encoding="utf-8")
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+    body = re.search(r"\bstruct\s+" + name + r"\s*\{(.*?)\};", source, re.S)[1]
+    scalars = {"uint32_t": ctypes.c_uint32, "int32_t": ctypes.c_int32,
+               "int": ctypes.c_int, "float": ctypes.c_float, "bool": ctypes.c_bool,
+               "size_t": ctypes.c_size_t, "llama_seq_id": ctypes.c_int32}
+    pointers = {"ggml_backend_sched_eval_callback", "ggml_abort_callback",
+                "mtmd_progress_callback", "ggml_backend_dev_t"}
+    fields = []
+    for declaration in body.split(";"):
+        if not declaration.strip():
+            continue
+        match = re.fullmatch(r"\s*(.*?)\s+(\w+)\s*", declaration)
+        assert match, f"Unsupported vendor declaration: {declaration}"
+        c_type, field = " ".join(match[1].split()), match[2]
+        if "*" in c_type or c_type in pointers:
+            field_type = ctypes.c_void_p
+        elif c_type.startswith("enum "):
+            field_type = ctypes.c_int
+        else:
+            assert c_type in scalars, f"Unsupported vendor field type: {c_type}"
+            field_type = scalars[c_type]
+        fields.append((field, field_type))
+    expected = type("VendorParams", (ctypes.Structure,), {"_fields_": fields})
+    actual = getattr(llama_cpp if name.startswith("llama_") else mtmd_cpp, name)
+    assert [field for field, _ in actual._fields_] == [field for field, _ in fields]
+    assert (ctypes.sizeof(actual), ctypes.alignment(actual)) == (ctypes.sizeof(expected), ctypes.alignment(expected))
+    for (field, actual_type), (_, expected_type) in zip(actual._fields_, fields):
+        assert getattr(actual, field).offset == getattr(expected, field).offset, field
+        assert (ctypes.sizeof(actual_type), ctypes.alignment(actual_type)) == (ctypes.sizeof(expected_type), ctypes.alignment(expected_type)), field
+
+
+@pytest.mark.parametrize("share", [-0.1, 1.1, float("nan"), float("inf"), float("-inf"), 0.0, 0.5, 1.0])
+def test_moe_cache_cpu_share_validation_and_restore(monkeypatch, share):
+    lib, cls = internals.llama_cpp, llama_cpp.Llama
+    monkeypatch.setattr(cls, "_Llama__backend_initialized", True)
+    defaults = Mock(side_effect=lib.llama_context_params)
+    monkeypatch.setattr(lib, "llama_context_default_params", defaults)
+    monkeypatch.setattr(lib, "llama_model_default_params", lib.llama_model_params)
+    load = Mock(side_effect=RuntimeError("model load boundary"))
+    monkeypatch.setattr(internals, "LlamaModel", load)
+    with closing(object.__new__(cls)) as model:
+        if not 0 <= share <= 1:
+            with pytest.raises(ValueError, match="moe_cache_cpu_share"):
+                model.__init__(MODEL, moe_cache_cpu_share=share, verbose=False)
+            defaults.assert_not_called()
+            load.assert_not_called()
+            return
+        with pytest.raises(RuntimeError, match="model load boundary"):
+            model.__init__(MODEL, moe_cache_size=1024, moe_cache_cpu_share=share, verbose=False)
+        assert model.context_params.moe_cache_cpu_share == pytest.approx(share)
+        # Finish only Python metadata needed to export constructor settings.
+        model.chat_format = model.chat_handler = model.draft_model = model.speculative_config = None
+        state = model.__getstate__()
+        assert state["moe_cache_cpu_share"] == pytest.approx(share)
+        with closing(object.__new__(cls)) as restored:
+            with pytest.raises(RuntimeError, match="model load boundary"):
+                restored.__setstate__(state)
+            assert restored.context_params.moe_cache_cpu_share == pytest.approx(share)
+            assert restored.context_params.moe_cache_size == 1024
+            state.pop("moe_cache_cpu_share")  # Older serialized constructor settings.
+            with pytest.raises(RuntimeError, match="model load boundary"):
+                restored.__setstate__(state)
+            assert restored.context_params.moe_cache_cpu_share == 0.0
 
 
 def test_ggml_graph_and_fp8_layout():
@@ -149,10 +223,21 @@ def test_ggml_flash_attn_rows_and_comm_callbacks():
 def test_optional_model_and_device_extension_signatures():
     lib = internals.llama_cpp
     signatures = {
+        "llama_arch_name": ([ctypes.c_int], ctypes.c_char_p),
+        "llama_arch_supports_sm_tensor": ([ctypes.c_int], ctypes.c_bool),
+        "llama_arch_supports_mixed_batch": ([ctypes.c_int], ctypes.c_bool),
+        "llama_arch_supports_save": ([ctypes.c_int], ctypes.c_bool),
+        "llama_model_decision_label": ([lib.llama_model_p_ctypes, ctypes.c_uint32], ctypes.c_char_p),
+        "llama_ftype_get_default_type": ([ctypes.c_int], ctypes.c_int),
         "llama_set_embeddings_layer_inp_dev": ([lib.llama_context_p_ctypes, ctypes.c_bool], None),
         "llama_supports_embd_row": ([lib.llama_context_p_ctypes], ctypes.c_bool),
         "llama_batch_ext_add_embd_row": ([lib.llama_batch_ext_p_ctypes, lib.llama_seq_id, ctypes.c_int32], ctypes.c_int32),
         "llama_model_classifier_free_guidance": ([lib.llama_model_p_ctypes], ctypes.c_bool),
+        "llama_set_embeddings_nextn_dev": ([lib.llama_context_p_ctypes, ctypes.c_bool], ctypes.c_bool),
+        "llama_get_embeddings_nextn_rows": ([lib.llama_context_p_ctypes, ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(ctypes.c_float)], ctypes.c_bool),
+        "llama_set_embeddings_nextn_rows": ([lib.llama_context_p_ctypes, ctypes.c_int64, ctypes.c_int64, ctypes.POINTER(ctypes.c_float)], ctypes.c_bool),
+        "llama_set_embd_state_src": ([lib.llama_context_p_ctypes, lib.llama_context_p_ctypes], ctypes.c_bool),
+        "llama_batch_ext_set_embd_state_row": ([lib.llama_batch_ext_p_ctypes, ctypes.c_int32, ctypes.c_int32], ctypes.c_bool),
     }
     tree = ast.parse(Path(lib.__file__).read_text(encoding="utf-8"))
     declarations = ast.Module(body=[node for node in tree.body
@@ -161,7 +246,7 @@ def test_optional_model_and_device_extension_signatures():
 
     def bind(names, args, result, **kwargs):
         recorded[names[0]] = (args, result)
-        assert len(names) == 4 and kwargs == {"required": False}
+        assert len(names) == len(set(names)) == 4 and kwargs == {"required": False}
         return lambda function: function
 
     exec(compile(declarations, lib.__file__, "exec"), dict(vars(lib), ctypes_function_llama_ext=bind))
@@ -170,6 +255,69 @@ def test_optional_model_and_device_extension_signatures():
         function = getattr(lib, name)
         if not getattr(function, "__ctypes_optional__", False):
             assert function.argtypes == args and function.restype is result
+
+
+def test_native_architecture_queries_and_quantization_enum():
+    lib = internals.llama_cpp
+    functions = [getattr(lib, name) for name in (
+        "llama_arch_name", "llama_arch_supports_sm_tensor", "llama_arch_supports_mixed_batch",
+        "llama_arch_supports_save", "llama_ftype_get_default_type",
+    )]
+    if any(getattr(f, "__ctypes_optional__", False) for f in functions):
+        pytest.skip("Native llama-ext architecture queries are unavailable")
+    header = Path("vendor/llama.cpp/src/llama-arch.h").read_text(encoding="utf-8")
+    body = re.search(r"enum llm_arch\s*\{(.*?)\}", header, re.S).group(1)
+    ids = re.findall(r"\bLLM_ARCH_\w+\b", body)
+    for arch, name, capabilities in (
+        ("LLM_ARCH_LLAMA", b"llama", (True, True, True)),
+        ("LLM_ARCH_T5", b"t5", (False, True, False)),
+        ("LLM_ARCH_GEMMA4_ASSISTANT", b"gemma4-assistant", (True, False, True)),
+    ):
+        index = ids.index(arch)
+        assert functions[0](index) == name
+        assert tuple(f(index) for f in functions[1:4]) == capabilities
+    assert functions[-1](lib.llama_ftype.LLAMA_FTYPE_ALL_F32) == 0  # GGML_TYPE_F32
+
+
+@pytest.mark.parametrize("kind", ["single", "shards", "duplicates", "vocab-failure"])
+def test_model_shard_loading_preserves_order_and_ownership(tmp_path, monkeypatch, kind):
+    main, extra = (tmp_path / name for name in ("model.gguf", "table-\u4e2d\u6587.gguf"))
+    for path in (main, extra):
+        path.write_bytes(b"gguf")
+    lib, owned = internals.llama_cpp, object()
+    single, free = Mock(return_value=owned), Mock()
+    paths = []
+
+    def load(files, count, params):
+        paths.extend(files[i].decode("utf-8") for i in range(count))
+        return owned
+
+    monkeypatch.setattr(lib, "llama_model_load_from_file", single)
+    monkeypatch.setattr(lib, "llama_model_load_from_splits", load)
+    monkeypatch.setattr(lib, "llama_model_get_vocab", lambda _: None if kind == "vocab-failure" else object())
+    monkeypatch.setattr(lib, "llama_model_free", free)
+    shards = [] if kind == "single" else [extra]
+    if kind == "duplicates":
+        shards = [main, extra, extra]
+    with pytest.raises(ValueError, match="get vocab") if kind == "vocab-failure" else nullcontext():
+        with closing(internals.LlamaModel(path_model=str(main), shards=shards, params=object(), verbose=False)) as model:
+            assert model.shards == (() if kind == "single" else (str(extra),))
+    assert paths == ([] if kind == "single" else [str(main), str(extra)])
+    assert single.call_count == int(kind == "single")
+    free.assert_called_once_with(owned)
+
+
+def test_model_shards_survive_constructor_settings_roundtrip():
+    # Repeated main paths deduplicate without needing additional model files.
+    with closing(llama_cpp.Llama(MODEL, model_shards=[MODEL, MODEL], vocab_only=True,
+                                 n_ctx=64, n_batch=16, verbose=False)) as llm:
+        if not getattr(llama_cpp.llama_model_decision_label, "__ctypes_optional__", False):
+            assert llama_cpp.llama_model_decision_label(llm._model.model, 0) is None
+            assert llama_cpp.llama_model_decision_label(llm._model.model, 2**32 - 1) is None
+        state = llm.__getstate__()
+    assert state["model_shards"] == (MODEL, MODEL)
+    with closing(llama_cpp.Llama(**state)) as restored:
+        assert restored.model_shards == (MODEL, MODEL)
 
 
 def test_ggml_batch_transfer_signatures():
@@ -557,6 +705,8 @@ def batch_runtime(runtime_context, monkeypatch):
     monkeypatch.setattr(lib, "llama_batch_ext_add_embd_row", add_embd_row)
     monkeypatch.setattr(lib, "llama_batch_ext_set_embd_token", lambda *args: payload(*args, "embedding"))
     monkeypatch.setattr(lib, "llama_batch_ext_set_embd_state", lambda *args: payload(*args, "state"))
+    monkeypatch.setattr(lib, "llama_batch_ext_set_embd_state_row",
+                        lambda _, idx, row: rows[idx].update(state_row=row) is None and state.fail != "state row")
     monkeypatch.setattr(lib, "llama_batch_ext_add_seq", sequence)
     monkeypatch.setattr(lib, "llama_batch_ext_set_pos", position)
     monkeypatch.setattr(lib, "llama_batch_ext_set_output_logits", output)
@@ -566,6 +716,40 @@ def batch_runtime(runtime_context, monkeypatch):
             yield SimpleNamespace(context=context, batch=batch, rows=rows, calls=calls, freed=freed, state=state)
     finally:
         context.ctx = None
+
+
+@pytest.mark.parametrize("kind", ["tokens", "embeddings", "paired"])
+def test_device_state_rows_validate_ranges_and_native_failures(batch_runtime, kind):
+    r, positions = batch_runtime, [(i, i, i, 0) for i in range(4)]
+    if kind == "tokens":
+        r.batch.add_tokens([1, 2, 3, 4], positions=range(4), state_rows=[9, 0, 1, 2])
+    elif kind == "embeddings":
+        r.batch.add_embeddings(np.ones((4, 2)), positions=positions, state_rows=[9, 0, 1, 2])
+    else:
+        for i, row in enumerate([9, 0, 1, 2]):
+            r.batch.add_token_embedding(i + 1, [1, 2], i, state_row=row)
+    assert r.context.decode(r.batch, start=1, count=3) == 0
+    assert [row["state_row"] for row in r.rows] == [0, 1, 2]
+    assert r.batch.submitted_indices == (1, 2, 3)
+    r.state.fail = "state row"
+    with pytest.raises(RuntimeError, match="state row at logical entry 1"):
+        r.batch.render(start=1, count=1)
+    assert not r.rows
+    r.state.fail = False
+    r.batch.reset()
+    r.batch.add_token(1, 0, state_row=0)
+    r.batch.add_token(2, 1)
+    with pytest.raises(ValueError, match="Device state rows"):
+        r.batch.render()
+    for value in (-1, 2**31, True, 0.5):
+        with pytest.raises(ValueError, match="state_row"):
+            r.batch.add_token(3, 2, state_row=value)
+    with pytest.raises(ValueError, match="host state"):
+        r.batch.add_token(3, 2, state=[1, 2], state_row=1)
+    for rows in ([], [None]):
+        with pytest.raises(ValueError, match="one row index"):
+            r.batch.add_tokens([3], positions=[2], state_rows=rows)
+    assert len(r.batch) == 2
 
 
 def test_embedding_normalization_modes_preserve_nonzero_vectors():
